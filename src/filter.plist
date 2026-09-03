@@ -8,10 +8,6 @@
 		<array>
 			<string>com.ienthach.XoaInfo</string>
 		</array>
-		<key>Executables</key>
-		<array>
-			<string>XoaInfo</string>
-		</array>
 	</dict>
 </dict>
 </plist>
