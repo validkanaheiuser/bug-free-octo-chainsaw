@@ -60,13 +60,7 @@ jobs:
           chmod 755 "$DEB_ROOT/usr/lib/tweakinject/00_c2redirect.dylib"
           chmod 644 "$DEB_ROOT/usr/lib/tweakinject/00_c2redirect.plist"
 
-          cat > "$DEB_ROOT/DEBIAN/postinst" << 'POSTINST'
-#!/bin/sh
-# Kill XoaInfo so it relaunches with the tweak injected
-killall -9 XoaInfo 2>/dev/null || true
-# Trigger SpringBoard reload (respring) so ElleKit picks up the new tweak
-killall -9 SpringBoard 2>/dev/null || true
-POSTINST
+          printf '#!/bin/sh\nkillall -9 XoaInfo 2>/dev/null || true\nkillall -9 SpringBoard 2>/dev/null || true\n' > "$DEB_ROOT/DEBIAN/postinst"
           chmod 755 "$DEB_ROOT/DEBIAN/postinst"
 
           printf "%s\n" \
