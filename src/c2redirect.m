@@ -8,6 +8,8 @@
 #import <CommonCrypto/CommonKeyDerivation.h>
 #import <CommonCrypto/CommonDigest.h>
 
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+
 #define LOG_TAG "[XoaBypass] "
 
 // ─── Param parsing ────────────────────────────────────────────────────────────
@@ -175,7 +177,8 @@ static NSURLSessionDataTask *hooked_dataTask(id self, SEL _cmd,
 
         if (body && completionHandler) {
             NSURL *url = request.URL;
-            void (^handler)(NSData *, NSURLResponse *, NSError *) = completionHandler;
+            void (^handler)(NSData *, NSURLResponse *, NSError *) =
+                (void (^)(NSData *, NSURLResponse *, NSError *))completionHandler;
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 200 * NSEC_PER_MSEC),
                            dispatch_get_global_queue(0, 0), ^{
                 NSHTTPURLResponse *resp = [[NSHTTPURLResponse alloc]

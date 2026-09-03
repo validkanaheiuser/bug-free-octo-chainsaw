@@ -29,13 +29,13 @@ jobs:
           
           echo "[*] Compiling arm64..."
           clang -target arm64-apple-ios14.0 -isysroot "$SDK" \
-            -dynamiclib -fobjc-arc -O2 \
+            -dynamiclib -fobjc-arc -O2 -Wno-deprecated-declarations \
             -framework Foundation -framework Security -framework Network \
             -o build/module_arm64.dylib src/c2redirect.m
 
           echo "[*] Compiling arm64e (with Apple PAC ABI)..."
           clang -target arm64e-apple-ios14.0 -isysroot "$SDK" \
-            -dynamiclib -fobjc-arc -O2 \
+            -dynamiclib -fobjc-arc -O2 -Wno-deprecated-declarations \
             -framework Foundation -framework Security -framework Network \
             -o build/module_arm64e.dylib src/c2redirect.m
 
@@ -52,18 +52,21 @@ jobs:
           DEB_ROOT="package_root"
           rm -rf "$DEB_ROOT"
           mkdir -p "$DEB_ROOT/DEBIAN"
-          mkdir -p "$DEB_ROOT/Library/MobileSubstrate/DynamicLibraries"
+          mkdir -p "$DEB_ROOT/usr/lib/tweakinject"
 
-          cp build/00_c2redirect.dylib "$DEB_ROOT/Library/MobileSubstrate/DynamicLibraries/00_c2redirect.dylib"
-          cp src/filter.plist "$DEB_ROOT/Library/MobileSubstrate/DynamicLibraries/00_c2redirect.plist"
+          cp build/00_c2redirect.dylib "$DEB_ROOT/usr/lib/tweakinject/00_c2redirect.dylib"
+          cp src/filter.plist "$DEB_ROOT/usr/lib/tweakinject/00_c2redirect.plist"
 
-          chmod 755 "$DEB_ROOT/Library/MobileSubstrate/DynamicLibraries/00_c2redirect.dylib"
-          chmod 644 "$DEB_ROOT/Library/MobileSubstrate/DynamicLibraries/00_c2redirect.plist"
+          chmod 755 "$DEB_ROOT/usr/lib/tweakinject/00_c2redirect.dylib"
+          chmod 644 "$DEB_ROOT/usr/lib/tweakinject/00_c2redirect.plist"
+
+          printf "#!/bin/sh\nmkdir -p /usr/lib/tweakinject\n" > "$DEB_ROOT/DEBIAN/postinst"
+          chmod 755 "$DEB_ROOT/DEBIAN/postinst"
 
           printf "%s\n" \
             "Package: com.research.c2redirect" \
             "Name: XoaInfo C2 Redirect (RootHide)" \
-            "Version: 1.0.0" \
+            "Version: 1.0.1" \
             "Architecture: iphoneos-arm64e" \
             "Description: Network redirection module for security research in isolated lab" \
             "Maintainer: Security Researcher" \
