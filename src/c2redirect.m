@@ -161,11 +161,20 @@ static NSData *buildTeamResponse(long long ecid) {
 static NSData *fakeBodyForRequest(NSURLRequest *request) {
     NSString *abs = request.URL.absoluteString;
     NSString *path = request.URL.path;
-    // Log every outbound request so we can see what XoaInfo actually calls
-    NSLog(@LOG_TAG "→ %@", abs);
 
-    BOOL isLogin = [path containsString:@"loginip"];
-    BOOL isTeam  = [path containsString:@"team"] || [path containsString:@"X2.1Public"];
+    // Log full request details
+    NSString *bodyStr = @"(no body)";
+    if (request.HTTPBody) {
+        bodyStr = [[NSString alloc] initWithData:request.HTTPBody encoding:NSUTF8StringEncoding]
+                  ?: @"(binary body)";
+    }
+    NSLog(@LOG_TAG "→ [%@] %@ body=%@", request.HTTPMethod, abs, bodyStr);
+
+    // Match on path OR body content (for proxy-routed requests via 127.0.0.1)
+    BOOL isLogin = [path containsString:@"loginip"] || [bodyStr containsString:@"loginip"]
+                   || [bodyStr containsString:@"checksum"];
+    BOOL isTeam  = [path containsString:@"team"]   || [bodyStr containsString:@"team"]
+                   || [path containsString:@"X2.1Public"] || [bodyStr containsString:@"X2.1Public"];
     if (!isLogin && !isTeam) return nil;
 
     NSDictionary *params = parseParams(request);
