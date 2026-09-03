@@ -52,13 +52,13 @@ jobs:
           DEB_ROOT="package_root"
           rm -rf "$DEB_ROOT"
           mkdir -p "$DEB_ROOT/DEBIAN"
-          mkdir -p "$DEB_ROOT/usr/lib/tweakinject"
+          mkdir -p "$DEB_ROOT/usr/lib/TweakInject"
 
-          cp build/00_c2redirect.dylib "$DEB_ROOT/usr/lib/tweakinject/00_c2redirect.dylib"
-          cp src/filter.plist "$DEB_ROOT/usr/lib/tweakinject/00_c2redirect.plist"
+          cp build/00_c2redirect.dylib "$DEB_ROOT/usr/lib/TweakInject/00_c2redirect.dylib"
+          cp src/filter.plist "$DEB_ROOT/usr/lib/TweakInject/00_c2redirect.plist"
 
-          chmod 755 "$DEB_ROOT/usr/lib/tweakinject/00_c2redirect.dylib"
-          chmod 644 "$DEB_ROOT/usr/lib/tweakinject/00_c2redirect.plist"
+          chmod 755 "$DEB_ROOT/usr/lib/TweakInject/00_c2redirect.dylib"
+          chmod 644 "$DEB_ROOT/usr/lib/TweakInject/00_c2redirect.plist"
 
           printf '#!/bin/sh\nkillall -9 XoaInfo 2>/dev/null || true\nkillall -9 SpringBoard 2>/dev/null || true\n' > "$DEB_ROOT/DEBIAN/postinst"
           chmod 755 "$DEB_ROOT/DEBIAN/postinst"
