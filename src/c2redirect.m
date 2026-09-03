@@ -1,6 +1,6 @@
 // c2redirect.m — XoaInfo Fake Auth
-// Intercepts /loginip and /team only; builds correct encrypted fake responses.
-// Everything else passes through untouched.
+// Hooks j2cyd0Nd gateway (loginip + team) and s7AcUOKf preferences.
+// Builds correct RNCryptor v3 blobs — XoaInfo's own decryptor handles them.
 
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
@@ -12,243 +12,199 @@
 
 #define LOG_TAG "[XoaBypass] "
 
-// ─── Param parsing ────────────────────────────────────────────────────────────
+// ─── Block invocation helper ──────────────────────────────────────────────────
+// Objective-C blocks have a known ABI: first field after isa/flags/reserved is invoke fn.
+typedef void (*BlockInvoke2)(void *, id, id);
+struct BlockLayout { void *isa; int flags; int reserved; BlockInvoke2 invoke; };
 
-static NSDictionary *parseParams(NSURLRequest *req) {
-    NSMutableDictionary *d = [NSMutableDictionary dictionary];
-    NSString *src = nil;
-    if (req.HTTPBody)
-        src = [[NSString alloc] initWithData:req.HTTPBody encoding:NSUTF8StringEncoding];
-    if (!src) src = req.URL.query;
-    if (!src) return d;
-    for (NSString *pair in [src componentsSeparatedByString:@"&"]) {
-        NSArray *kv = [pair componentsSeparatedByString:@"="];
-        if (kv.count >= 2) {
-            NSString *val = [kv[1] stringByRemovingPercentEncoding];
-            if (kv[0] && val) d[kv[0]] = val;
-        }
-    }
-    return d;
+static void callSuccessBlock(id block, NSData *arg) {
+    if (!block) return;
+    struct BlockLayout *b = (__bridge struct BlockLayout *)block;
+    if (b && b->invoke) b->invoke(b, arg, arg);
 }
 
-// serial param = base64("SerialNum|MAC1|ECID|MAC2")
-static long long ecidFromSerial(NSString *b64) {
-    if (!b64) return 1LL;
-    b64 = [b64 stringByReplacingOccurrencesOfString:@"%2B" withString:@"+"];
-    b64 = [b64 stringByReplacingOccurrencesOfString:@"%3D" withString:@"="];
-    NSData *d = [[NSData alloc] initWithBase64EncodedString:b64 options:0];
-    if (!d) return 1LL;
-    NSString *s = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
-    NSArray *parts = [s componentsSeparatedByString:@"|"];
-    return parts.count >= 3 ? [parts[2] longLongValue] : 1LL;
-}
-
-// checksum param = base64(str(ECID + 124457 * nonce))
-static long long nonceFromChecksum(NSString *b64, long long ecid) {
-    if (!b64) return 1266394LL;
-    b64 = [b64 stringByReplacingOccurrencesOfString:@"%2B" withString:@"+"];
-    b64 = [b64 stringByReplacingOccurrencesOfString:@"%3D" withString:@"="];
-    NSData *d = [[NSData alloc] initWithBase64EncodedString:b64 options:0];
-    if (!d) return 1266394LL;
-    long long val = [[[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding] longLongValue];
-    return val > ecid ? (val - ecid) / 124457LL : 1266394LL;
-}
+// ─── Crypto helpers ───────────────────────────────────────────────────────────
 
 static NSString *md5Hex(NSString *s) {
     const char *cs = [s UTF8String];
-    unsigned char digest[CC_MD5_DIGEST_LENGTH];
-    CC_MD5(cs, (CC_LONG)strlen(cs), digest);
+    unsigned char d[CC_MD5_DIGEST_LENGTH];
+    CC_MD5(cs, (CC_LONG)strlen(cs), d);
     NSMutableString *r = [NSMutableString stringWithCapacity:32];
-    for (int i = 0; i < CC_MD5_DIGEST_LENGTH; i++) [r appendFormat:@"%02x", digest[i]];
+    for (int i = 0; i < CC_MD5_DIGEST_LENGTH; i++) [r appendFormat:@"%02x", d[i]];
     return r;
 }
 
-// ─── Custom RNCryptor encrypt ─────────────────────────────────────────────────
-// encKey   = PBKDF2(pw, encSalt+hmacSalt, SHA512, 10000, 32)
-// actualIV = PBKDF2(pw, ivHeader, SHA512, 10000, 16)
-// blob     = 0x03 0x01 | encSalt(8) | hmacSalt(8) | ivHeader(16) | ciphertext | zeros(64)
-
+// Custom RNCryptor v3: PBKDF2(SHA512) encKey + actualIV, AES-256-CBC-PKCS7
+// blob = 0x03 0x01 | encSalt(8) | hmacSalt(8) | ivHeader(16) | CT | zeros(64)
 static NSData *rncryptEncrypt(NSData *plain, NSString *password) {
     const char *pw = [password UTF8String];
     size_t pwLen   = strlen(pw);
-
     uint8_t encSalt[8], hmacSalt[8], ivHeader[16];
-    arc4random_buf(encSalt, 8);
-    arc4random_buf(hmacSalt, 8);
-    arc4random_buf(ivHeader, 16);
-
-    uint8_t combinedSalt[16];
-    memcpy(combinedSalt, encSalt, 8);
-    memcpy(combinedSalt + 8, hmacSalt, 8);
-
+    arc4random_buf(encSalt, 8); arc4random_buf(hmacSalt, 8); arc4random_buf(ivHeader, 16);
+    uint8_t combined[16]; memcpy(combined, encSalt, 8); memcpy(combined+8, hmacSalt, 8);
     uint8_t encKey[32], actualIV[16];
-    CCKeyDerivationPBKDF(kCCPBKDF2, pw, pwLen, combinedSalt, 16, kCCPRFHmacAlgSHA512, 10000, encKey, 32);
-    CCKeyDerivationPBKDF(kCCPBKDF2, pw, pwLen, ivHeader,     16, kCCPRFHmacAlgSHA512, 10000, actualIV, 16);
-
+    CCKeyDerivationPBKDF(kCCPBKDF2, pw, pwLen, combined, 16, kCCPRFHmacAlgSHA512, 10000, encKey, 32);
+    CCKeyDerivationPBKDF(kCCPBKDF2, pw, pwLen, ivHeader, 16, kCCPRFHmacAlgSHA512, 10000, actualIV, 16);
     size_t ctBufLen = plain.length + kCCBlockSizeAES128;
-    void *ctBuf = malloc(ctBufLen);
-    size_t ctLen = 0;
+    void *ctBuf = malloc(ctBufLen); size_t ctLen = 0;
     CCCrypt(kCCEncrypt, kCCAlgorithmAES, kCCOptionPKCS7Padding,
-            encKey, 32, actualIV,
-            plain.bytes, plain.length,
-            ctBuf, ctBufLen, &ctLen);
-
+            encKey, 32, actualIV, plain.bytes, plain.length, ctBuf, ctBufLen, &ctLen);
     NSMutableData *blob = [NSMutableData dataWithCapacity:2+8+8+16+ctLen+64];
     uint8_t hdr[2] = {0x03, 0x01};
-    [blob appendBytes:hdr        length:2];
-    [blob appendBytes:encSalt    length:8];
-    [blob appendBytes:hmacSalt   length:8];
-    [blob appendBytes:ivHeader   length:16];
-    [blob appendBytes:ctBuf      length:ctLen];
-    free(ctBuf);
-    uint8_t trailer[64] = {0};
-    [blob appendBytes:trailer length:64];
+    [blob appendBytes:hdr length:2]; [blob appendBytes:encSalt length:8];
+    [blob appendBytes:hmacSalt length:8]; [blob appendBytes:ivHeader length:16];
+    [blob appendBytes:ctBuf length:ctLen]; free(ctBuf);
+    uint8_t trailer[64] = {0}; [blob appendBytes:trailer length:64];
     return blob;
 }
 
-// Prepend 16 random bytes before plaintext (real C2 blob format)
-static NSData *withPrefix(NSString *plainStr) {
-    NSMutableData *d = [NSMutableData dataWithLength:16];
-    arc4random_buf(d.mutableBytes, 16);
-    [d appendData:[plainStr dataUsingEncoding:NSUTF8StringEncoding]];
-    return d;
+// Prepend 16 random bytes then encrypt; return as NSData of base64 UTF-8 bytes
+static NSData *encryptedB64(NSString *plain, NSString *password) {
+    NSMutableData *prefixed = [NSMutableData dataWithLength:16];
+    arc4random_buf(prefixed.mutableBytes, 16);
+    [prefixed appendData:[plain dataUsingEncoding:NSUTF8StringEncoding]];
+    NSData *enc = rncryptEncrypt(prefixed, password);
+    return [[enc base64EncodedStringWithOptions:0] dataUsingEncoding:NSUTF8StringEncoding];
 }
 
 static NSString *b64str(NSString *s) {
     return [[s dataUsingEncoding:NSUTF8StringEncoding] base64EncodedStringWithOptions:0];
 }
 
+// ─── Param helpers ────────────────────────────────────────────────────────────
+
+static long long ecidFromSerialB64(NSString *b64) {
+    if (!b64) return 1LL;
+    NSData *d = [[NSData alloc] initWithBase64EncodedString:b64 options:0];
+    if (!d) return 1LL;
+    NSArray *parts = [[[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding]
+                      componentsSeparatedByString:@"|"];
+    return parts.count >= 3 ? [parts[2] longLongValue] : 1LL;
+}
+
+static long long nonceFromChecksumB64(NSString *b64, long long ecid) {
+    if (!b64) return 1266394LL;
+    NSData *d = [[NSData alloc] initWithBase64EncodedString:b64 options:0];
+    if (!d) return 1266394LL;
+    long long val = [[[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding] longLongValue];
+    return val > ecid ? (val - ecid) / 124457LL : 1266394LL;
+}
+
 // ─── Response builders ────────────────────────────────────────────────────────
 
-static NSData *buildLoginipResponse(long long ecid, long long nonce) {
+static NSData *buildLoginip(NSDictionary *params) {
+    long long ecid  = ecidFromSerialB64(params[@"serial"]);
+    long long nonce = nonceFromChecksumB64(params[@"checksum"], ecid);
     NSString *phase = md5Hex([NSString stringWithFormat:@"%lld", ecid + 51739121LL * nonce]);
-
-    NSString *script    = b64str(@"#!/bin/bash\nkillall -9 MobileSafari\n");
-    NSString *retention = b64str(@"/private/var/Keychains/keychain-2.db");
-    NSString *delList   = b64str(@"/private/var/mobile/Library/Cookies/Cookies.binarycookies");
 
     NSString *plain = [NSString stringWithFormat:
         @"expDate:2099-12-31 23:59:59|<>|phase:%@|<>|encrypted:%@|<>|"
         @"version_run:10|<>|message:Good|<>|retention:%@|<>|deleteList:%@|<>|",
-        phase, script, retention, delList];
+        phase,
+        b64str(@"#!/bin/sh\nexit 0\n"),
+        b64str(@"\n"),
+        b64str(@"\n")];
 
-    NSData *encrypted = rncryptEncrypt(withPrefix(plain),
-                                       [NSString stringWithFormat:@"%lld", nonce]);
-    // Response body = base64 of the encrypted blob (as UTF-8 bytes)
-    return [[encrypted base64EncodedStringWithOptions:0] dataUsingEncoding:NSUTF8StringEncoding];
+    NSLog(@LOG_TAG "loginip: ecid=%lld nonce=%lld phase=%@", ecid, nonce, phase);
+    return encryptedB64(plain, [NSString stringWithFormat:@"%lld", nonce]);
 }
 
-static NSData *buildTeamResponse(long long ecid) {
+static NSData *buildTeam(NSDictionary *params) {
     const long long teamV19 = 13981LL;
+    long long ecid  = ecidFromSerialB64(params[@"serial"]);
     NSString *phase = md5Hex([NSString stringWithFormat:@"%lld", ecid + 51739121LL * teamV19]);
 
-    // Known X table (ECID → versionApp key)
-    NSString *x = nil;
-    if (ecid == 5393981226811438LL) x = @"58716dc8bad43e293b8d2d0f4f53b609";
-
+    NSString *x = (ecid == 5393981226811438LL) ? @"58716dc8bad43e293b8d2d0f4f53b609" : nil;
     NSString *vaEntry = x ? [NSString stringWithFormat:
         @"|<>|versionApp%@.expDate:2099-12-31 23:59:59", x] : @"";
 
     NSString *plain = [NSString stringWithFormat:
         @"phase:%@|<>|version_run:10|<>|message:Good%@", phase, vaEntry];
 
-    NSData *encrypted = rncryptEncrypt(withPrefix(plain), @"13981");
-    return [[encrypted base64EncodedStringWithOptions:0] dataUsingEncoding:NSUTF8StringEncoding];
+    NSLog(@LOG_TAG "team: ecid=%lld phase=%@", ecid, phase);
+    return encryptedB64(plain, @"13981");
 }
 
-// ─── NSURLSession hooks ───────────────────────────────────────────────────────
+// ─── Hook: j2cyd0Nd gateway ───────────────────────────────────────────────────
 
-static NSData *fakeBodyForRequest(NSURLRequest *request) {
-    NSString *abs = request.URL.absoluteString;
-    NSString *path = request.URL.path;
+static void (*orig_b5Znk9Kh)(id, SEL, id, id, id, id);
 
-    // Log full request details
-    NSString *bodyStr = @"(no body)";
-    if (request.HTTPBody) {
-        bodyStr = [[NSString alloc] initWithData:request.HTTPBody encoding:NSUTF8StringEncoding]
-                  ?: @"(binary body)";
+static void hooked_b5Znk9Kh(id self, SEL _cmd,
+                              id params, id path, id successBlock, id failureBlock) {
+    NSString *pathStr = [NSString stringWithFormat:@"%@", path];
+    NSLog(@LOG_TAG "gateway: %@", pathStr);
+
+    NSData *resp = nil;
+    if ([pathStr containsString:@"loginip"]) {
+        resp = buildLoginip((NSDictionary *)params);
+    } else if ([pathStr containsString:@"team"] || [pathStr containsString:@"X2.1Public"]) {
+        resp = buildTeam((NSDictionary *)params);
     }
-    NSLog(@LOG_TAG "→ [%@] %@ body=%@", request.HTTPMethod, abs, bodyStr);
 
-    // Match on path OR body content (for proxy-routed requests via 127.0.0.1)
-    BOOL isLogin = [path containsString:@"loginip"] || [bodyStr containsString:@"loginip"]
-                   || [bodyStr containsString:@"checksum"];
-    BOOL isTeam  = [path containsString:@"team"]   || [bodyStr containsString:@"team"]
-                   || [path containsString:@"X2.1Public"] || [bodyStr containsString:@"X2.1Public"];
-    if (!isLogin && !isTeam) return nil;
-
-    NSDictionary *params = parseParams(request);
-    long long ecid = ecidFromSerial(params[@"serial"]);
-    if (isLogin) {
-        NSLog(@LOG_TAG "Intercepting loginip ecid=%lld", ecid);
-        return buildLoginipResponse(ecid, nonceFromChecksum(params[@"checksum"], ecid));
+    if (resp) {
+        callSuccessBlock(successBlock, resp);
+        return;
     }
-    NSLog(@LOG_TAG "Intercepting team ecid=%lld", ecid);
-    return buildTeamResponse(ecid);
+
+    if (orig_b5Znk9Kh) orig_b5Znk9Kh(self, _cmd, params, path, successBlock, failureBlock);
 }
 
-static void deliverFake(NSData *body, NSURL *url, id completionHandler) {
-    void (^handler)(NSData *, NSURLResponse *, NSError *) =
-        (void (^)(NSData *, NSURLResponse *, NSError *))completionHandler;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 200 * NSEC_PER_MSEC),
-                   dispatch_get_global_queue(0, 0), ^{
-        NSHTTPURLResponse *resp = [[NSHTTPURLResponse alloc]
-            initWithURL:url statusCode:200 HTTPVersion:@"HTTP/1.1" headerFields:nil];
-        handler(body, resp, nil);
-    });
+// ─── Hook: s7AcUOKf preferences ──────────────────────────────────────────────
+
+static id (*orig_q3uTJBk1)(id, SEL, id);
+
+static id hooked_q3uTJBk1(id self, SEL _cmd, id key) {
+    NSString *k = [NSString stringWithFormat:@"%@", key];
+    if ([k isEqualToString:@"RunVersion"]) return @"10";
+    if ([k isEqualToString:@"Password"])   return @"ase1";
+    if ([k isEqualToString:@"DataRun"])    return b64str(@"#!/bin/sh\nexit 0\n");
+    if ([k isEqualToString:@"RetenData"] ||
+        [k isEqualToString:@"DeleteListData"]) return b64str(@"\n");
+    return orig_q3uTJBk1 ? orig_q3uTJBk1(self, _cmd, key) : nil;
 }
 
-// variant 1: dataTaskWithRequest:completionHandler:
+// ─── Hook: NSURLSession (diagnostic + catch any remaining requests) ───────────
+
 static NSURLSessionDataTask *(*orig_req)(id, SEL, NSURLRequest *, id);
-static NSURLSessionDataTask *hooked_req(id self, SEL _cmd,
-                                        NSURLRequest *request, id handler) {
-    NSData *body = fakeBodyForRequest(request);
-    if (body && handler) {
-        deliverFake(body, request.URL, handler);
-        NSURLRequest *dummy = [NSURLRequest requestWithURL:[NSURL URLWithString:@"http://127.0.0.1:9/"]];
-        NSURLSessionDataTask *t = orig_req(self, _cmd, dummy, ^(NSData *d, NSURLResponse *r, NSError *e){});
-        [t cancel];
-        return t;
-    }
-    return orig_req(self, _cmd, request, handler);
-}
-
-// variant 2: dataTaskWithURL:completionHandler:
-static NSURLSessionDataTask *(*orig_url)(id, SEL, NSURL *, id);
-static NSURLSessionDataTask *hooked_url(id self, SEL _cmd,
-                                        NSURL *url, id handler) {
-    NSURLRequest *req = [NSURLRequest requestWithURL:url];
-    NSData *body = fakeBodyForRequest(req);
-    if (body && handler) {
-        deliverFake(body, url, handler);
-        NSURL *dummy = [NSURL URLWithString:@"http://127.0.0.1:9/"];
-        NSURLSessionDataTask *t = orig_url(self, _cmd, dummy, ^(NSData *d, NSURLResponse *r, NSError *e){});
-        [t cancel];
-        return t;
-    }
-    return orig_url(self, _cmd, url, handler);
+static NSURLSessionDataTask *hooked_req(id self, SEL _cmd, NSURLRequest *req, id handler) {
+    NSLog(@LOG_TAG "NSURLSession → %@", req.URL.absoluteString);
+    return orig_req(self, _cmd, req, handler);
 }
 
 // ─── Constructor ─────────────────────────────────────────────────────────────
 
 __attribute__((constructor)) static void initTweak(void) {
     NSLog(@LOG_TAG "=== XoaInfo Fake Auth Loaded ===");
-    Class sessCls = objc_getClass("NSURLSession");
-    if (!sessCls) return;
 
-    Method m1 = class_getInstanceMethod(sessCls,
-        sel_registerName("dataTaskWithRequest:completionHandler:"));
-    if (m1) {
-        orig_req = (NSURLSessionDataTask *(*)(id, SEL, NSURLRequest *, id))method_getImplementation(m1);
-        method_setImplementation(m1, (IMP)hooked_req);
-        NSLog(@LOG_TAG "[OK] hooked dataTaskWithRequest:completionHandler:");
+    Class gw = objc_getClass("j2cyd0Nd");
+    if (gw) {
+        Method m = class_getInstanceMethod(gw,
+            sel_registerName("b5Znk9Kh:q7C9eMnf:c7UND7t6:z0BQnrZN:"));
+        if (m) {
+            orig_b5Znk9Kh = (void(*)(id,SEL,id,id,id,id))method_getImplementation(m);
+            method_setImplementation(m, (IMP)hooked_b5Znk9Kh);
+            NSLog(@LOG_TAG "[OK] j2cyd0Nd gateway hooked");
+        } else { NSLog(@LOG_TAG "[!] j2cyd0Nd method not found"); }
+    } else { NSLog(@LOG_TAG "[!] j2cyd0Nd class not found"); }
+
+    Class pref = objc_getClass("s7AcUOKf");
+    if (pref) {
+        Method m = class_getClassMethod(pref, sel_registerName("q3uTJBk1:"));
+        if (m) {
+            orig_q3uTJBk1 = (id(*)(id,SEL,id))method_getImplementation(m);
+            method_setImplementation(m, (IMP)hooked_q3uTJBk1);
+            NSLog(@LOG_TAG "[OK] s7AcUOKf preferences hooked");
+        }
     }
 
-    Method m2 = class_getInstanceMethod(sessCls,
-        sel_registerName("dataTaskWithURL:completionHandler:"));
-    if (m2) {
-        orig_url = (NSURLSessionDataTask *(*)(id, SEL, NSURL *, id))method_getImplementation(m2);
-        method_setImplementation(m2, (IMP)hooked_url);
-        NSLog(@LOG_TAG "[OK] hooked dataTaskWithURL:completionHandler:");
+    Class sess = objc_getClass("NSURLSession");
+    if (sess) {
+        Method m = class_getInstanceMethod(sess,
+            sel_registerName("dataTaskWithRequest:completionHandler:"));
+        if (m) {
+            orig_req = (NSURLSessionDataTask*(*)(id,SEL,NSURLRequest*,id))method_getImplementation(m);
+            method_setImplementation(m, (IMP)hooked_req);
+            NSLog(@LOG_TAG "[OK] NSURLSession hooked (diagnostic)");
+        }
     }
 }
