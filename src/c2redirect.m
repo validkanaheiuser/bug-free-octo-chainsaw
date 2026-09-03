@@ -1,10 +1,10 @@
 //
 //  c2redirect.m
-//  XoaInfo Standalone On-Device Bypass & Direct Decryptor Hook
+//  XoaInfo Standalone On-Device Bypass & Targeted Decryptor Hook
 //
 //  100% Standalone - NO PC, NO Wi-Fi, NO Proxy, NO Mock Server needed!
-//  Bypasses Custom RNCryptor decryption by directly hooking y8WisN9t c6chSi59:q69GFYW9:error:
-//  and pre-authorizing s7AcUOKf license preferences.
+//  Fixes dispatch_sync deadlock by passing through internal app startup decrypts
+//  and avoiding calls to j04enrKe on the main queue.
 //
 
 #import <Foundation/Foundation.h>
@@ -16,6 +16,11 @@
 #import <SystemConfiguration/SystemConfiguration.h>
 
 #define LOG_TAG @"[XoaInfo-StandaloneBypass] "
+
+#pragma mark - Global State
+
+static long long g_cachedHardwareID = 5393981226811438LL;
+static NSString *g_currentLoginNonce = nil;
 
 #pragma mark - Block Layout Structure
 
@@ -43,7 +48,7 @@ static NSString *MD5String(NSString *str) {
     return result;
 }
 
-#pragma mark - Hook: y8WisN9t (Direct Decryptor Hook - Silver Bullet)
+#pragma mark - Hook: y8WisN9t (Targeted Decryptor Hook)
 
 static id (*orig_c6chSi59)(id self, SEL _cmd, id data, id password, id *error);
 
@@ -51,47 +56,43 @@ static id hooked_c6chSi59(id self, SEL _cmd, id data, id password, id *error) {
     NSString *pwdStr = [NSString stringWithFormat:@"%@", password];
     NSLog(LOG_TAG @"y8WisN9t decrypt called with password: %@", pwdStr);
 
-    if ([pwdStr isEqualToString:@"13981"] || [pwdStr length] == 0) {
-        // Phase 2: Team / Function check
+    // 1. Phase 2 (Team / Reset Data verification)
+    if ([pwdStr isEqualToString:@"13981"]) {
         NSLog(LOG_TAG @"Supplying decrypted Phase 2 token");
         NSString *p2 = @"phase:78ce0133206b9856c1d8633b1c2642fd|<>|version_run:10|<>|message:Good|<>|versionApp58716dc8bad43e293b8d2d0f4f53b609.expDate:|<>|";
         return [p2 dataUsingEncoding:NSUTF8StringEncoding];
     }
 
-    // Phase 1: Login verification
-    long long nonce = [pwdStr longLongValue];
-    long long hardwareID = 5393981226811438LL;
-    Class j04Cls = objc_getClass("j04enrKe");
-    if (j04Cls) {
-        SEL hwSel = sel_registerName("x8WAxHKH");
-        if ([j04Cls respondsToSelector:hwSel]) {
-            id hwIdObj = ((id (*)(id, SEL))objc_msgSend)(j04Cls, hwSel);
-            if (hwIdObj) {
-                hardwareID = [hwIdObj longLongValue];
-            }
-        }
+    // 2. Phase 1 (Login verification): ONLY intercept if password matches the current login nonce
+    if (g_currentLoginNonce && [pwdStr isEqualToString:g_currentLoginNonce]) {
+        long long nonce = [pwdStr longLongValue];
+        long long phaseVal = g_cachedHardwareID + 51739121LL * nonce;
+        NSString *phaseStr = MD5String([NSString stringWithFormat:@"%lld", phaseVal]);
+        NSLog(LOG_TAG @"Supplying valid Phase 1 plaintext for Nonce=%lld, Phase=%@", nonce, phaseStr);
+
+        NSString *safeDropper = @"IyEvYmluL3NoCmV4aXQgMAo="; // #!/bin/sh\nexit 0\n
+        NSString *safeRetention = @"Cg==";
+        NSString *safeDeleteList = @"Cg==";
+
+        NSString *plaintext = [NSString stringWithFormat:
+            @"expDate:2099-12-31 23:59:59|<>|"
+            @"phase:%@|<>|"
+            @"encrypted:%@|<>|"
+            @"version_run:10|<>|"
+            @"message:Good|<>|"
+            @"retention:%@|<>|"
+            @"deleteList:%@|<>|",
+            phaseStr, safeDropper, safeRetention, safeDeleteList];
+
+        return [plaintext dataUsingEncoding:NSUTF8StringEncoding];
     }
 
-    long long phaseVal = hardwareID + 51739121LL * nonce;
-    NSString *phaseStr = MD5String([NSString stringWithFormat:@"%lld", phaseVal]);
-    NSLog(LOG_TAG @"y8WisN9t: Returning valid Phase 1 plaintext for Nonce=%lld, Phase=%@", nonce, phaseStr);
-
-    // Safe benign research payloads
-    NSString *safeDropper = @"IyEvYmluL3NoCmV4aXQgMAo="; // #!/bin/sh\nexit 0\n
-    NSString *safeRetention = @"Cg==";
-    NSString *safeDeleteList = @"Cg==";
-
-    NSString *plaintext = [NSString stringWithFormat:
-        @"expDate:2099-12-31 23:59:59|<>|"
-        @"phase:%@|<>|"
-        @"encrypted:%@|<>|"
-        @"version_run:10|<>|"
-        @"message:Good|<>|"
-        @"retention:%@|<>|"
-        @"deleteList:%@|<>|",
-        phaseStr, safeDropper, safeRetention, safeDeleteList];
-
-    return [plaintext dataUsingEncoding:NSUTF8StringEncoding];
+    // 3. For any other password (e.g. "2345636" used by AppDelegate on app launch):
+    // Pass through to the original decryptor so internal app resources decrypt normally!
+    if (orig_c6chSi59) {
+        return orig_c6chSi59(self, _cmd, data, password, error);
+    }
+    return nil;
 }
 
 #pragma mark - Hook: j2cyd0Nd (UI Network Gateway)
@@ -103,7 +104,37 @@ static void hooked_b5Znk9Kh(id self, SEL _cmd, id params, id path, id successBlo
     NSLog(LOG_TAG @"j2cyd0Nd gateway called for path: %@", pathStr);
 
     if ([pathStr containsString:@"loginip"] || [pathStr containsString:@"redeem"]) {
-        // Provide dummy base64 data to satisfy initWithBase64EncodedString:
+        // 1. Extract HardwareID from serial
+        NSString *serialB64 = params[@"serial"];
+        if (serialB64) {
+            NSData *serialData = [[NSData alloc] initWithBase64EncodedString:serialB64 options:0];
+            if (serialData) {
+                NSString *serialStr = [[NSString alloc] initWithData:serialData encoding:NSUTF8StringEncoding];
+                NSArray *parts = [serialStr componentsSeparatedByString:@"|"];
+                if ([parts count] >= 3) {
+                    g_cachedHardwareID = [parts[2] longLongValue];
+                }
+            }
+        }
+
+        // 2. Extract Nonce from checksum
+        long long nonce = 1266394LL;
+        NSString *checksumB64 = params[@"checksum"];
+        if (checksumB64) {
+            NSData *checksumData = [[NSData alloc] initWithBase64EncodedString:checksumB64 options:0];
+            if (checksumData) {
+                NSString *checksumStr = [[NSString alloc] initWithData:checksumData encoding:NSUTF8StringEncoding];
+                long long checksumVal = [checksumStr longLongValue];
+                if (checksumVal > g_cachedHardwareID) {
+                    nonce = (checksumVal - g_cachedHardwareID) / 124457LL;
+                }
+            }
+        }
+
+        g_currentLoginNonce = [NSString stringWithFormat:@"%lld", nonce];
+        NSLog(LOG_TAG @"Registered login nonce: %@, HardwareID: %lld", g_currentLoginNonce, g_cachedHardwareID);
+
+        // Dummy base64 data to feed sub_1006A77C0 (which will pass it to hooked_c6chSi59)
         NSString *dummyB64 = @"AwHLLIAjcqPU9kyy8sYdUvb5qm7/bMiAOJkYS5UewFVQ2MVknUlvikHEfXxPXEn0iT8je0NwRcmt/P/vZzWYN5Zw1vl4c7+xaL1bL+euW5uJzsvGj25cb+m/Kgm1z/ZIgdSmUwkgvueFop4FfT8tgraonj6FgX4DwUjJ4D/MIIDPy5DFoVJ79j711wnB19I9Et8qPAiNsewjZ9DAHY37zoURJ5jEEBUJFuSbEQi2Z9/LyfLuSEyvYW8XJtQ4WbJkDDJ/LtQW3wxeSpDqDVnxGEkOlpM4jilAxJVwcown+TwOYuNEGqtzy8Wj0gGnXZjL5lsz5d89f5BN21CsEAyN0giY";
         NSData *response = [dummyB64 dataUsingEncoding:NSUTF8StringEncoding];
 
@@ -243,7 +274,7 @@ __attribute__((constructor)) static void initTweak(void) {
         }
     }
 
-    // 3. Hook Preferences Class s7AcUOKf & Pre-populate valid license
+    // 3. Hook Preferences Class s7AcUOKf
     Class prefCls = objc_getClass("s7AcUOKf");
     if (prefCls) {
         SEL sel = sel_registerName("q3uTJBk1:");
@@ -252,17 +283,6 @@ __attribute__((constructor)) static void initTweak(void) {
             orig_q3uTJBk1 = (id (*)(id, SEL, id))method_getImplementation(m);
             method_setImplementation(m, (IMP)hooked_q3uTJBk1);
             NSLog(LOG_TAG @"[OK] Hooked s7AcUOKf preferences");
-        }
-
-        SEL setPref = sel_registerName("c2Uu7nHV:forKey:");
-        if ([prefCls respondsToSelector:setPref]) {
-            void (*setter)(id, SEL, id, id) = (void (*)(id, SEL, id, id))objc_msgSend;
-            setter(prefCls, setPref, @"10", @"RunVersion");
-            setter(prefCls, setPref, @"IyEvYmluL3NoCmV4aXQgMAo=", @"DataRun");
-            setter(prefCls, setPref, @"Cg==", @"RetenData");
-            setter(prefCls, setPref, @"Cg==", @"DeleteListData");
-            setter(prefCls, setPref, @"ase1", @"Password");
-            NSLog(LOG_TAG @"[OK] Pre-populated valid license in s7AcUOKf");
         }
     }
 
