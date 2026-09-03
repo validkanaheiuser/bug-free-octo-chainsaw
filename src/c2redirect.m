@@ -3,7 +3,7 @@
 //  XoaInfo Standalone On-Device Bypass & C2 Response Synthesizer
 //
 //  100% Standalone - NO PC, NO Wi-Fi, NO Proxy, NO Mock Server needed!
-//  Generates valid Custom RNCryptor payloads directly in memory on-device.
+//  Fixed Block Calling Convention (ABI register alignment for ARM64).
 //
 
 #import <Foundation/Foundation.h>
@@ -188,7 +188,7 @@ static NSData *SynthesizePhase1Response(NSDictionary *params) {
 
     NSString *password = [NSString stringWithFormat:@"%lld", nonce];
     NSData *encryptedResponse = CustomRNCryptor_Encrypt(password, plaintext);
-    NSLog(LOG_TAG @"[Phase 1] Successfully generated Custom RNCryptor response in memory!");
+    NSLog(LOG_TAG @"[Phase 1] Successfully generated Custom RNCryptor response in memory (%lu bytes)!", (unsigned long)[encryptedResponse length]);
     return encryptedResponse;
 }
 
@@ -210,24 +210,41 @@ static void hooked_b5Znk9Kh(id self, SEL _cmd, id params, id path, id successBlo
     if ([pathStr containsString:@"loginip"] || [pathStr containsString:@"redeem"]) {
         NSData *response = SynthesizePhase1Response((NSDictionary *)params);
         if (successBlock && response) {
-            void (^success)(id, int, id) = (void (^)(id, int, id))successBlock;
             dispatch_async(dispatch_get_main_queue(), ^{
-                success(nil, 200, response);
+                @try {
+                    NSLog(LOG_TAG @"Dispatching synthesized response into successBlock...");
+                    //
+                    // CRITICAL ABI FIX:
+                    // In ARM64, the block implementation sub_1006A77C0 reads register X2 as the response NSData!
+                    // Calling (response, response) places response into BOTH X1 and X2, completely eliminating
+                    // register mismatch and preventing objc_retain crash on invalid status codes!
+                    //
+                    void (^block)(id, id) = (void (^)(id, id))successBlock;
+                    block(response, response);
+                    NSLog(LOG_TAG @"[SUCCESS] successBlock executed cleanly without errors!");
+                } @catch (NSException *ex) {
+                    NSLog(LOG_TAG @"Exception calling successBlock: %@", ex);
+                }
             });
-            return; // Completely resolved in memory!
+            return;
         }
     } else if ([pathStr containsString:@"team"] || [pathStr containsString:@"X2.1Public"]) {
         NSData *response = SynthesizePhase2Response((NSDictionary *)params);
         if (successBlock && response) {
-            void (^success)(id, int, id) = (void (^)(id, int, id))successBlock;
             dispatch_async(dispatch_get_main_queue(), ^{
-                success(nil, 200, response);
+                @try {
+                    NSLog(LOG_TAG @"Dispatching Phase 2 response into successBlock...");
+                    void (^block)(id, id) = (void (^)(id, id))successBlock;
+                    block(response, response);
+                    NSLog(LOG_TAG @"[SUCCESS] Phase 2 block executed cleanly!");
+                } @catch (NSException *ex) {
+                    NSLog(LOG_TAG @"Exception in Phase 2 block: %@", ex);
+                }
             });
-            return; // Completely resolved in memory!
+            return;
         }
     }
 
-    // Default fallback
     if (orig_b5Znk9Kh) {
         orig_b5Znk9Kh(self, _cmd, params, path, successBlock, failureBlock);
     }
@@ -295,7 +312,12 @@ static id hooked_q3uTJBk1(id self, SEL _cmd, id key) {
         return @"ase1";
     }
     if (orig_q3uTJBk1) {
-        return orig_q3uTJBk1(self, _cmd, key);
+        id val = orig_q3uTJBk1(self, _cmd, key);
+        if (!val) {
+            if ([keyStr isEqualToString:@"realModel"]) return @"iPhone10,3";
+            if ([keyStr isEqualToString:@"realInterModel"]) return @"D22AP";
+        }
+        return val;
     }
     return nil;
 }
