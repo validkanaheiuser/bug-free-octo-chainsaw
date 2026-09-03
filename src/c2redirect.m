@@ -156,45 +156,68 @@ static NSData *buildTeamResponse(long long ecid) {
     return [[encrypted base64EncodedStringWithOptions:0] dataUsingEncoding:NSUTF8StringEncoding];
 }
 
-// ─── NSURLSession hook ────────────────────────────────────────────────────────
+// ─── NSURLSession hooks ───────────────────────────────────────────────────────
 
-static NSURLSessionDataTask *(*orig_dataTask)(id, SEL, NSURLRequest *, id);
-
-static NSURLSessionDataTask *hooked_dataTask(id self, SEL _cmd,
-                                              NSURLRequest *request, id completionHandler) {
+static NSData *fakeBodyForRequest(NSURLRequest *request) {
+    NSString *abs = request.URL.absoluteString;
     NSString *path = request.URL.path;
+    // Log every outbound request so we can see what XoaInfo actually calls
+    NSLog(@LOG_TAG "→ %@", abs);
+
     BOOL isLogin = [path containsString:@"loginip"];
     BOOL isTeam  = [path containsString:@"team"] || [path containsString:@"X2.1Public"];
+    if (!isLogin && !isTeam) return nil;
 
-    if (isLogin || isTeam) {
-        NSLog(@LOG_TAG "Intercepted: %@", path);
-        NSDictionary *params = parseParams(request);
-        long long ecid = ecidFromSerial(params[@"serial"]);
-
-        NSData *body = isLogin
-            ? buildLoginipResponse(ecid, nonceFromChecksum(params[@"checksum"], ecid))
-            : buildTeamResponse(ecid);
-
-        if (body && completionHandler) {
-            NSURL *url = request.URL;
-            void (^handler)(NSData *, NSURLResponse *, NSError *) =
-                (void (^)(NSData *, NSURLResponse *, NSError *))completionHandler;
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 200 * NSEC_PER_MSEC),
-                           dispatch_get_global_queue(0, 0), ^{
-                NSHTTPURLResponse *resp = [[NSHTTPURLResponse alloc]
-                    initWithURL:url statusCode:200 HTTPVersion:@"HTTP/1.1" headerFields:nil];
-                handler(body, resp, nil);
-            });
-        }
-
-        // Return a dummy cancelled task so callers can safely call [task resume]
-        NSURLRequest *dummy = [NSURLRequest requestWithURL:[NSURL URLWithString:@"http://127.0.0.1:9/"]];
-        NSURLSessionDataTask *task = orig_dataTask(self, _cmd, dummy, ^(NSData *d, NSURLResponse *r, NSError *e){});
-        [task cancel];
-        return task;
+    NSDictionary *params = parseParams(request);
+    long long ecid = ecidFromSerial(params[@"serial"]);
+    if (isLogin) {
+        NSLog(@LOG_TAG "Intercepting loginip ecid=%lld", ecid);
+        return buildLoginipResponse(ecid, nonceFromChecksum(params[@"checksum"], ecid));
     }
+    NSLog(@LOG_TAG "Intercepting team ecid=%lld", ecid);
+    return buildTeamResponse(ecid);
+}
 
-    return orig_dataTask(self, _cmd, request, completionHandler);
+static void deliverFake(NSData *body, NSURL *url, id completionHandler) {
+    void (^handler)(NSData *, NSURLResponse *, NSError *) =
+        (void (^)(NSData *, NSURLResponse *, NSError *))completionHandler;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 200 * NSEC_PER_MSEC),
+                   dispatch_get_global_queue(0, 0), ^{
+        NSHTTPURLResponse *resp = [[NSHTTPURLResponse alloc]
+            initWithURL:url statusCode:200 HTTPVersion:@"HTTP/1.1" headerFields:nil];
+        handler(body, resp, nil);
+    });
+}
+
+// variant 1: dataTaskWithRequest:completionHandler:
+static NSURLSessionDataTask *(*orig_req)(id, SEL, NSURLRequest *, id);
+static NSURLSessionDataTask *hooked_req(id self, SEL _cmd,
+                                        NSURLRequest *request, id handler) {
+    NSData *body = fakeBodyForRequest(request);
+    if (body && handler) {
+        deliverFake(body, request.URL, handler);
+        NSURLRequest *dummy = [NSURLRequest requestWithURL:[NSURL URLWithString:@"http://127.0.0.1:9/"]];
+        NSURLSessionDataTask *t = orig_req(self, _cmd, dummy, ^(NSData *d, NSURLResponse *r, NSError *e){});
+        [t cancel];
+        return t;
+    }
+    return orig_req(self, _cmd, request, handler);
+}
+
+// variant 2: dataTaskWithURL:completionHandler:
+static NSURLSessionDataTask *(*orig_url)(id, SEL, NSURL *, id);
+static NSURLSessionDataTask *hooked_url(id self, SEL _cmd,
+                                        NSURL *url, id handler) {
+    NSURLRequest *req = [NSURLRequest requestWithURL:url];
+    NSData *body = fakeBodyForRequest(req);
+    if (body && handler) {
+        deliverFake(body, url, handler);
+        NSURL *dummy = [NSURL URLWithString:@"http://127.0.0.1:9/"];
+        NSURLSessionDataTask *t = orig_url(self, _cmd, dummy, ^(NSData *d, NSURLResponse *r, NSError *e){});
+        [t cancel];
+        return t;
+    }
+    return orig_url(self, _cmd, url, handler);
 }
 
 // ─── Constructor ─────────────────────────────────────────────────────────────
@@ -203,10 +226,20 @@ __attribute__((constructor)) static void initTweak(void) {
     NSLog(@LOG_TAG "=== XoaInfo Fake Auth Loaded ===");
     Class sessCls = objc_getClass("NSURLSession");
     if (!sessCls) return;
-    SEL sel = sel_registerName("dataTaskWithRequest:completionHandler:");
-    Method m = class_getInstanceMethod(sessCls, sel);
-    if (!m) return;
-    orig_dataTask = (NSURLSessionDataTask *(*)(id, SEL, NSURLRequest *, id))method_getImplementation(m);
-    method_setImplementation(m, (IMP)hooked_dataTask);
-    NSLog(@LOG_TAG "[OK] NSURLSession hooked — intercepting /loginip and /team only");
+
+    Method m1 = class_getInstanceMethod(sessCls,
+        sel_registerName("dataTaskWithRequest:completionHandler:"));
+    if (m1) {
+        orig_req = (NSURLSessionDataTask *(*)(id, SEL, NSURLRequest *, id))method_getImplementation(m1);
+        method_setImplementation(m1, (IMP)hooked_req);
+        NSLog(@LOG_TAG "[OK] hooked dataTaskWithRequest:completionHandler:");
+    }
+
+    Method m2 = class_getInstanceMethod(sessCls,
+        sel_registerName("dataTaskWithURL:completionHandler:"));
+    if (m2) {
+        orig_url = (NSURLSessionDataTask *(*)(id, SEL, NSURL *, id))method_getImplementation(m2);
+        method_setImplementation(m2, (IMP)hooked_url);
+        NSLog(@LOG_TAG "[OK] hooked dataTaskWithURL:completionHandler:");
+    }
 }
