@@ -1,9 +1,9 @@
 //
 //  c2redirect.m
-//  XoaInfo C2 Redirect & Analysis Hook
+//  XoaInfo Standalone On-Device Bypass & C2 Response Synthesizer
 //
-//  Reverse-engineered custom RNCryptor engine and local C2 mock response generator
-//  for malware analysis in isolated laboratory environment.
+//  100% Standalone - NO PC, NO Wi-Fi, NO Proxy, NO Mock Server needed!
+//  Generates valid Custom RNCryptor payloads directly in memory on-device.
 //
 
 #import <Foundation/Foundation.h>
@@ -11,8 +11,9 @@
 #import <CommonCrypto/CommonCryptor.h>
 #import <CommonCrypto/CommonKeyDerivation.h>
 #import <CommonCrypto/CommonDigest.h>
+#import <SystemConfiguration/SystemConfiguration.h>
 
-#define LOG_TAG @"[XoaInfo-C2Redirect] "
+#define LOG_TAG @"[XoaInfo-StandaloneBypass] "
 
 #pragma mark - Cryptographic Helpers
 
@@ -29,17 +30,7 @@ static NSString *MD5String(NSString *str) {
 }
 
 //
-// Custom RNCryptor v3 Implementation:
-// Header: [0x03, 0x01] + encSalt (8B) + hmacSalt (8B) + ivHeader (16B)
-// Key Derivation:
-//   salt1 = encSalt (8B) + hmacSalt (8B) = 16B
-//   encKey = PBKDF2(PRF=HMAC-SHA512, pwd, salt1, rounds=10000, dklen=32)
-//   salt2 = ivHeader (16B)
-//   actualIV = PBKDF2(PRF=HMAC-SHA512, pwd, salt2, rounds=10000, dklen=16)
-// Cipher:
-//   AES-256-CBC, PKCS7 padding
-// Trailer:
-//   32 bytes trailing data (HMAC placeholder)
+// Custom RNCryptor Engine (Reversed from XoaInfo malware)
 //
 static NSData *CustomRNCryptor_Encrypt(NSString *password, NSString *plaintext) {
     if (!password || !plaintext) return nil;
@@ -51,6 +42,7 @@ static NSData *CustomRNCryptor_Encrypt(NSString *password, NSString *plaintext) 
     arc4random_buf(hmacSalt, sizeof(hmacSalt));
     arc4random_buf(ivHeader, sizeof(ivHeader));
 
+    // salt1 = encSalt (8) + hmacSalt (8) = 16 bytes
     uint8_t salt1[16];
     memcpy(salt1, encSalt, 8);
     memcpy(salt1 + 8, hmacSalt, 8);
@@ -58,7 +50,7 @@ static NSData *CustomRNCryptor_Encrypt(NSString *password, NSString *plaintext) 
     const char *pwdStr = [password UTF8String];
     size_t pwdLen = strlen(pwdStr);
 
-    // Derive 32-byte AES key
+    // 1. Derive 32-byte AES key via PBKDF2 HMAC-SHA512 (10,000 rounds)
     uint8_t encKey[32];
     int status = CCKeyDerivationPBKDF(
         kCCPBKDF2,
@@ -76,7 +68,7 @@ static NSData *CustomRNCryptor_Encrypt(NSString *password, NSString *plaintext) 
         return nil;
     }
 
-    // Derive 16-byte actual AES IV from ivHeader
+    // 2. Derive 16-byte actual AES IV from ivHeader via PBKDF2 HMAC-SHA512 (10,000 rounds)
     uint8_t actualIV[16];
     status = CCKeyDerivationPBKDF(
         kCCPBKDF2,
@@ -94,6 +86,7 @@ static NSData *CustomRNCryptor_Encrypt(NSString *password, NSString *plaintext) 
         return nil;
     }
 
+    // 3. Encrypt plaintext with AES-256-CBC, PKCS7 padding
     NSData *plainData = [plaintext dataUsingEncoding:NSUTF8StringEncoding];
     size_t cipherBufferSize = [plainData length] + kCCBlockSizeAES128;
     void *cipherBuffer = malloc(cipherBufferSize);
@@ -118,7 +111,8 @@ static NSData *CustomRNCryptor_Encrypt(NSString *password, NSString *plaintext) 
         return nil;
     }
 
-    // Assemble raw packet
+    // 4. Assemble wire packet:
+    // [0x03, 0x01] + encSalt (8) + hmacSalt (8) + ivHeader (16) + ciphertext + trailer (32)
     NSMutableData *packet = [NSMutableData dataWithCapacity:2 + 8 + 8 + 16 + bytesEncrypted + 32];
     uint8_t prefix[2] = { 0x03, 0x01 };
     [packet appendBytes:prefix length:2];
@@ -133,18 +127,18 @@ static NSData *CustomRNCryptor_Encrypt(NSString *password, NSString *plaintext) 
     arc4random_buf(trailer, sizeof(trailer));
     [packet appendBytes:trailer length:32];
 
-    // Base64 encode to string as expected by XoaInfo
+    // 5. Base64 encode string to NSData
     NSString *base64Str = [packet base64EncodedStringWithOptions:0];
     return [base64Str dataUsingEncoding:NSUTF8StringEncoding];
 }
 
-#pragma mark - Response Synthesis
+#pragma mark - On-Device Dynamic Response Synthesis
 
 static NSData *SynthesizePhase1Response(NSDictionary *params) {
-    NSLog(LOG_TAG @"Synthesizing Phase 1 response for params: %@", params);
+    NSLog(LOG_TAG @"[Phase 1] Intercepted on-device Login request. Synthesizing valid response...");
 
-    // 1. Extract HardwareID from decoded serial
-    long long hardwareID = 5393981226811438LL; // fallback default
+    // 1. Extract HardwareID from serial (or live device query)
+    long long hardwareID = 5393981226811438LL;
     NSString *serialB64 = params[@"serial"];
     if (serialB64) {
         NSData *serialData = [[NSData alloc] initWithBase64EncodedString:serialB64 options:0];
@@ -153,13 +147,12 @@ static NSData *SynthesizePhase1Response(NSDictionary *params) {
             NSArray *parts = [serialStr componentsSeparatedByString:@"|"];
             if ([parts count] >= 3) {
                 hardwareID = [parts[2] longLongValue];
-                NSLog(LOG_TAG @"Extracted hardwareID from serial: %lld", hardwareID);
             }
         }
     }
 
-    // 2. Extract nonce from decoded checksum: checksum = hardwareID + 124457 * nonce
-    long long nonce = 1266394LL; // fallback
+    // 2. Extract nonce from checksum: checksum_val = hardwareID + 124457 * nonce
+    long long nonce = 1266394LL;
     NSString *checksumB64 = params[@"checksum"];
     if (checksumB64) {
         NSData *checksumData = [[NSData alloc] initWithBase64EncodedString:checksumB64 options:0];
@@ -168,7 +161,6 @@ static NSData *SynthesizePhase1Response(NSDictionary *params) {
             long long checksumVal = [checksumStr longLongValue];
             if (checksumVal > hardwareID) {
                 nonce = (checksumVal - hardwareID) / 124457LL;
-                NSLog(LOG_TAG @"Derived nonce: %lld (from checksum: %lld)", nonce, checksumVal);
             }
         }
     }
@@ -176,12 +168,11 @@ static NSData *SynthesizePhase1Response(NSDictionary *params) {
     // 3. Compute phase = md5(hardwareID + 51739121 * nonce)
     long long phaseVal = hardwareID + 51739121LL * nonce;
     NSString *phaseStr = MD5String([NSString stringWithFormat:@"%lld", phaseVal]);
-    NSLog(LOG_TAG @"Computed valid phase: %@", phaseStr);
 
-    // 4. Safe benign research payloads (does NOT infect or wipe research device!)
-    // Base64 of "#!/bin/sh\nexit 0\n"
-    NSString *safeDropper = @"IyEvYmluL3NoCmV4aXQgMAo=";
-    // Empty safe lists
+    NSLog(LOG_TAG @"[Phase 1] Nonce=%lld, HardwareID=%lld, Computed Phase Token=%@", nonce, hardwareID, phaseStr);
+
+    // 4. Neutralized safe payload (Prevents wiping Keychains or dropping remote backdoors)
+    NSString *safeDropper = @"IyEvYmluL3NoCmV4aXQgMAo="; // #!/bin/sh\nexit 0\n
     NSString *safeRetention = @"Cg==";
     NSString *safeDeleteList = @"Cg==";
 
@@ -190,67 +181,66 @@ static NSData *SynthesizePhase1Response(NSDictionary *params) {
         @"phase:%@|<>|"
         @"encrypted:%@|<>|"
         @"version_run:10|<>|"
-        @"message:Good (Active Research Bypass)|<>|"
+        @"message:Good (Standalone On-Device Bypass Active)|<>|"
         @"retention:%@|<>|"
         @"deleteList:%@|<>|",
         phaseStr, safeDropper, safeRetention, safeDeleteList];
 
     NSString *password = [NSString stringWithFormat:@"%lld", nonce];
     NSData *encryptedResponse = CustomRNCryptor_Encrypt(password, plaintext);
-    NSLog(LOG_TAG @"Generated Phase 1 encrypted payload (%lu bytes)", (unsigned long)[encryptedResponse length]);
+    NSLog(LOG_TAG @"[Phase 1] Successfully generated Custom RNCryptor response in memory!");
     return encryptedResponse;
 }
 
 static NSData *SynthesizePhase2Response(NSDictionary *params) {
-    NSLog(LOG_TAG @"Synthesizing Phase 2 (Team/Function verification) response");
-    // Pre-encrypted valid phase 2 response (matches exact token accepted by binary)
+    NSLog(LOG_TAG @"[Phase 2] Intercepted on-device Function Verification request.");
+    // Pre-encrypted valid Phase 2 token matching exact binary authorization
     NSString *phase2B64 = @"AwHLLIAjcqPU9kyy8sYdUvb5qm7/bMiAOJkYS5UewFVQ2MVknUlvikHEfXxPXEn0iT8je0NwRcmt/P/vZzWYN5Zw1vl4c7+xaL1bL+euW5uJzsvGj25cb+m/Kgm1z/ZIgdSmUwkgvueFop4FfT8tgraonj6FgX4DwUjJ4D/MIIDPy5DFoVJ79j711wnB19I9Et8qPAiNsewjZ9DAHY37zoURJ5jEEBUJFuSbEQi2Z9/LyfLuSEyvYW8XJtQ4WbJkDDJ/LtQW3wxeSpDqDVnxGEkOlpM4jilAxJVwcown+TwOYuNEGqtzy8Wj0gGnXZjL5lsz5d89f5BN21CsEAyN0giY";
     return [phase2B64 dataUsingEncoding:NSUTF8StringEncoding];
 }
 
-#pragma mark - Hooks: j2cyd0Nd
+#pragma mark - Hook: j2cyd0Nd (UI Network Gateway)
 
 static void (*orig_b5Znk9Kh)(id self, SEL _cmd, id params, id path, id successBlock, id failureBlock);
 
 static void hooked_b5Znk9Kh(id self, SEL _cmd, id params, id path, id successBlock, id failureBlock) {
     NSString *pathStr = [NSString stringWithFormat:@"%@", path];
-    NSLog(LOG_TAG @"Intercepted network gateway call to path: %@", pathStr);
+    NSLog(LOG_TAG @"j2cyd0Nd gateway called for path: %@", pathStr);
 
     if ([pathStr containsString:@"loginip"] || [pathStr containsString:@"redeem"]) {
-        NSLog(LOG_TAG @"Handling Phase 1 Login request locally...");
         NSData *response = SynthesizePhase1Response((NSDictionary *)params);
         if (successBlock && response) {
             void (^success)(id, int, id) = (void (^)(id, int, id))successBlock;
             dispatch_async(dispatch_get_main_queue(), ^{
                 success(nil, 200, response);
             });
-            return;
+            return; // Completely resolved in memory!
         }
     } else if ([pathStr containsString:@"team"] || [pathStr containsString:@"X2.1Public"]) {
-        NSLog(LOG_TAG @"Handling Phase 2 Function Verification request locally...");
         NSData *response = SynthesizePhase2Response((NSDictionary *)params);
         if (successBlock && response) {
             void (^success)(id, int, id) = (void (^)(id, int, id))successBlock;
             dispatch_async(dispatch_get_main_queue(), ^{
                 success(nil, 200, response);
             });
-            return;
+            return; // Completely resolved in memory!
         }
     }
 
+    // Default fallback
     if (orig_b5Znk9Kh) {
         orig_b5Znk9Kh(self, _cmd, params, path, successBlock, failureBlock);
     }
 }
 
-#pragma mark - Hooks: NSURLSession (Low-level Interceptor)
+#pragma mark - Hook: NSURLSession (Low-level In-Memory Interceptor)
 
 static NSURLSessionDataTask *(*orig_dataTaskWithRequest)(id self, SEL _cmd, NSURLRequest *request, id completionHandler);
 
 static NSURLSessionDataTask *hooked_dataTaskWithRequest(id self, SEL _cmd, NSURLRequest *request, id completionHandler) {
     NSString *urlStr = [[request URL] absoluteString];
     if ([urlStr containsString:@"xoainfo"] || [urlStr containsString:@"125.212.220.224"]) {
-        NSLog(LOG_TAG @"Intercepted low-level NSURLSession request to: %@", urlStr);
+        NSLog(LOG_TAG @"Intercepted NSURLSession call to C2: %@", urlStr);
         if (completionHandler) {
             void (^handler)(NSData *, NSURLResponse *, NSError *) = (void (^)(NSData *, NSURLResponse *, NSError *))completionHandler;
             NSData *responseBody = nil;
@@ -277,14 +267,29 @@ static NSURLSessionDataTask *hooked_dataTaskWithRequest(id self, SEL _cmd, NSURL
     return nil;
 }
 
-#pragma mark - Hooks: Preference & License Overrides
+#pragma mark - Hook: c5p96gdE (Login View Controller auto-fill)
+
+static void (*orig_n56shZcq)(id self, SEL _cmd, id password);
+
+static void hooked_n56shZcq(id self, SEL _cmd, id password) {
+    NSString *pwd = (NSString *)password;
+    if (!pwd || [pwd length] == 0) {
+        pwd = @"ase1";
+        NSLog(LOG_TAG @"Auto-filled password 'ase1'");
+    }
+    if (orig_n56shZcq) {
+        orig_n56shZcq(self, _cmd, pwd);
+    }
+}
+
+#pragma mark - Hook: Preference & Authorization Overrides
 
 static id (*orig_q3uTJBk1)(id self, SEL _cmd, id key);
 
 static id hooked_q3uTJBk1(id self, SEL _cmd, id key) {
     NSString *keyStr = [NSString stringWithFormat:@"%@", key];
     if ([keyStr isEqualToString:@"RunVersion"]) {
-        return @"10"; // Fully authorized execution mode
+        return @"10"; // Authorized mode
     }
     if ([keyStr isEqualToString:@"Password"]) {
         return @"ase1";
@@ -295,46 +300,75 @@ static id hooked_q3uTJBk1(id self, SEL _cmd, id key) {
     return nil;
 }
 
-#pragma mark - Tweak Initialization
+#pragma mark - Hook: Offline Reachability Simulation
+
+static BOOL hooked_isReachable(id self, SEL _cmd) {
+    return YES;
+}
+
+#pragma mark - Tweak Constructor
 
 __attribute__((constructor)) static void initTweak(void) {
-    NSLog(LOG_TAG @"=== XoaInfo Security Research C2 Redirect Loaded ===");
+    NSLog(LOG_TAG @"=== XoaInfo 100%% Standalone On-Device Bypass Loaded ===");
 
     // 1. Hook Gateway Class j2cyd0Nd
     Class gatewayCls = objc_getClass("j2cyd0Nd");
     if (gatewayCls) {
-        SEL selGateway = sel_registerName("b5Znk9Kh:q7C9eMnf:c7UND7t6:z0BQnrZN:");
-        Method mGateway = class_getInstanceMethod(gatewayCls, selGateway);
-        if (mGateway) {
-            orig_b5Znk9Kh = (void (*)(id, SEL, id, id, id, id))method_getImplementation(mGateway);
-            method_setImplementation(mGateway, (IMP)hooked_b5Znk9Kh);
-            NSLog(LOG_TAG @"Successfully hooked j2cyd0Nd b5Znk9Kh:q7C9eMnf:c7UND7t6:z0BQnrZN:");
+        SEL sel = sel_registerName("b5Znk9Kh:q7C9eMnf:c7UND7t6:z0BQnrZN:");
+        Method m = class_getInstanceMethod(gatewayCls, sel);
+        if (m) {
+            orig_b5Znk9Kh = (void (*)(id, SEL, id, id, id, id))method_getImplementation(m);
+            method_setImplementation(m, (IMP)hooked_b5Znk9Kh);
+            NSLog(LOG_TAG @"[OK] Hooked j2cyd0Nd gateway");
         }
     }
 
     // 2. Hook Preferences Class s7AcUOKf
     Class prefCls = objc_getClass("s7AcUOKf");
     if (prefCls) {
-        SEL selPref = sel_registerName("q3uTJBk1:");
-        Method mPref = class_getClassMethod(prefCls, selPref);
-        if (mPref) {
-            orig_q3uTJBk1 = (id (*)(id, SEL, id))method_getImplementation(mPref);
-            method_setImplementation(mPref, (IMP)hooked_q3uTJBk1);
-            NSLog(LOG_TAG @"Successfully hooked s7AcUOKf q3uTJBk1:");
+        SEL sel = sel_registerName("q3uTJBk1:");
+        Method m = class_getClassMethod(prefCls, sel);
+        if (m) {
+            orig_q3uTJBk1 = (id (*)(id, SEL, id))method_getImplementation(m);
+            method_setImplementation(m, (IMP)hooked_q3uTJBk1);
+            NSLog(LOG_TAG @"[OK] Hooked s7AcUOKf preferences");
         }
     }
 
-    // 3. Hook NSURLSession dataTaskWithRequest:completionHandler:
+    // 3. Hook Login View Controller c5p96gdE
+    Class loginVCCls = objc_getClass("c5p96gdE");
+    if (loginVCCls) {
+        SEL sel = sel_registerName("n56shZcq:");
+        Method m = class_getInstanceMethod(loginVCCls, sel);
+        if (m) {
+            orig_n56shZcq = (void (*)(id, SEL, id))method_getImplementation(m);
+            method_setImplementation(m, (IMP)hooked_n56shZcq);
+            NSLog(LOG_TAG @"[OK] Hooked c5p96gdE login action");
+        }
+    }
+
+    // 4. Hook Reachability to simulate online connection in Airplane mode
+    Class reachCls = objc_getClass("p4m7JskN");
+    if (reachCls) {
+        SEL sel = sel_registerName("isReachable");
+        Method m = class_getInstanceMethod(reachCls, sel);
+        if (m) {
+            method_setImplementation(m, (IMP)hooked_isReachable);
+            NSLog(LOG_TAG @"[OK] Hooked Reachability (p4m7JskN isReachable)");
+        }
+    }
+
+    // 5. Hook NSURLSession
     Class sessionCls = objc_getClass("NSURLSession");
     if (sessionCls) {
-        SEL selSession = sel_registerName("dataTaskWithRequest:completionHandler:");
-        Method mSession = class_getInstanceMethod(sessionCls, selSession);
-        if (mSession) {
-            orig_dataTaskWithRequest = (NSURLSessionDataTask *(*)(id, SEL, NSURLRequest *, id))method_getImplementation(mSession);
-            method_setImplementation(mSession, (IMP)hooked_dataTaskWithRequest);
-            NSLog(LOG_TAG @"Successfully hooked NSURLSession dataTaskWithRequest:completionHandler:");
+        SEL sel = sel_registerName("dataTaskWithRequest:completionHandler:");
+        Method m = class_getInstanceMethod(sessionCls, sel);
+        if (m) {
+            orig_dataTaskWithRequest = (NSURLSessionDataTask *(*)(id, SEL, NSURLRequest *, id))method_getImplementation(m);
+            method_setImplementation(m, (IMP)hooked_dataTaskWithRequest);
+            NSLog(LOG_TAG @"[OK] Hooked NSURLSession");
         }
     }
 
-    NSLog(LOG_TAG @"Initialization complete. All C2 communication will be intercepted and resolved locally.");
+    NSLog(LOG_TAG @"Standalone bypass ready. Zero network required.");
 }
