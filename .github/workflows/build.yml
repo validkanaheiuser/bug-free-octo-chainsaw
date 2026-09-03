@@ -60,19 +60,25 @@ jobs:
           chmod 755 "$DEB_ROOT/usr/lib/tweakinject/00_c2redirect.dylib"
           chmod 644 "$DEB_ROOT/usr/lib/tweakinject/00_c2redirect.plist"
 
-          printf "#!/bin/sh\nmkdir -p /usr/lib/tweakinject\n" > "$DEB_ROOT/DEBIAN/postinst"
+          cat > "$DEB_ROOT/DEBIAN/postinst" << 'POSTINST'
+#!/bin/sh
+# Kill XoaInfo so it relaunches with the tweak injected
+killall -9 XoaInfo 2>/dev/null || true
+# Trigger SpringBoard reload (respring) so ElleKit picks up the new tweak
+killall -9 SpringBoard 2>/dev/null || true
+POSTINST
           chmod 755 "$DEB_ROOT/DEBIAN/postinst"
 
           printf "%s\n" \
             "Package: com.research.c2redirect" \
             "Name: XoaInfo C2 Redirect (RootHide)" \
-            "Version: 1.0.1" \
+            "Version: 1.0.2" \
             "Architecture: iphoneos-arm64e" \
             "Description: Network redirection module for security research in isolated lab" \
             "Maintainer: Security Researcher" \
             "Author: Security Researcher" \
             "Section: Tweaks" \
-            "Depends: mobilesubstrate" > "$DEB_ROOT/DEBIAN/control"
+            "Depends: ellekit" > "$DEB_ROOT/DEBIAN/control"
 
           dpkg-deb --build --root-owner-group "$DEB_ROOT" output/XoaInfoC2Redirect_RootHide_arm64e.deb
           ls -la output/
