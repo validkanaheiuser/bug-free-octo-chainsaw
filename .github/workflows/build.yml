@@ -1,0 +1,81 @@
+name: Build iOS arm64 / arm64e Tweak
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Xcode
+        run: |
+          sudo xcode-select -switch /Applications/Xcode.app/Contents/Developer
+          xcrun --sdk iphoneos --show-sdk-path
+
+      - name: Install dependencies
+        run: |
+          brew install ldid dpkg
+
+      - name: Compile FAT Mach-O (arm64 + arm64e)
+        run: |
+          mkdir -p build output
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          
+          echo "[*] Compiling arm64..."
+          clang -target arm64-apple-ios14.0 -isysroot "$SDK" \
+            -dynamiclib -fobjc-arc -O2 \
+            -framework Foundation -framework Security -framework Network \
+            -o build/module_arm64.dylib src/c2redirect.m
+
+          echo "[*] Compiling arm64e (with Apple PAC ABI)..."
+          clang -target arm64e-apple-ios14.0 -isysroot "$SDK" \
+            -dynamiclib -fobjc-arc -O2 \
+            -framework Foundation -framework Security -framework Network \
+            -o build/module_arm64e.dylib src/c2redirect.m
+
+          echo "[*] Creating Universal FAT Binary..."
+          lipo -create build/module_arm64.dylib build/module_arm64e.dylib \
+            -output build/00_c2redirect.dylib
+
+          echo "[*] Signing with ldid..."
+          ldid -S build/00_c2redirect.dylib
+          lipo -info build/00_c2redirect.dylib
+
+      - name: Package RootHide .deb
+        run: |
+          DEB_ROOT="package_root"
+          rm -rf "$DEB_ROOT"
+          mkdir -p "$DEB_ROOT/DEBIAN"
+          mkdir -p "$DEB_ROOT/Library/MobileSubstrate/DynamicLibraries"
+
+          cp build/00_c2redirect.dylib "$DEB_ROOT/Library/MobileSubstrate/DynamicLibraries/00_c2redirect.dylib"
+          cp src/filter.plist "$DEB_ROOT/Library/MobileSubstrate/DynamicLibraries/00_c2redirect.plist"
+
+          chmod 755 "$DEB_ROOT/Library/MobileSubstrate/DynamicLibraries/00_c2redirect.dylib"
+          chmod 644 "$DEB_ROOT/Library/MobileSubstrate/DynamicLibraries/00_c2redirect.plist"
+
+          printf "%s\n" \
+            "Package: com.research.c2redirect" \
+            "Name: XoaInfo C2 Redirect (RootHide)" \
+            "Version: 1.0.0" \
+            "Architecture: iphoneos-arm64e" \
+            "Description: Network redirection module for security research in isolated lab" \
+            "Maintainer: Security Researcher" \
+            "Author: Security Researcher" \
+            "Section: Tweaks" \
+            "Depends: mobilesubstrate" > "$DEB_ROOT/DEBIAN/control"
+
+          dpkg-deb --build --root-owner-group "$DEB_ROOT" output/XoaInfoC2Redirect_RootHide_arm64e.deb
+          ls -la output/
+
+      - name: Upload Deb Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: XoaInfoC2Redirect_RootHide_arm64e
+          path: output/*.deb
