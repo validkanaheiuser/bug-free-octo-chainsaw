@@ -3,7 +3,7 @@
 //  XoaInfo Standalone On-Device Bypass & C2 Response Synthesizer
 //
 //  100% Standalone - NO PC, NO Wi-Fi, NO Proxy, NO Mock Server needed!
-//  Fixed Block Calling Convention (ABI register alignment for ARM64).
+//  Fixed Stack Block Dangling Pointer via Synchronous In-Place Invocation.
 //
 
 #import <Foundation/Foundation.h>
@@ -14,6 +14,18 @@
 #import <SystemConfiguration/SystemConfiguration.h>
 
 #define LOG_TAG @"[XoaInfo-StandaloneBypass] "
+
+#pragma mark - Block Layout Structure
+
+typedef void (*BlockInvokeFn)(void *, id, id);
+
+struct CustomBlockLayout {
+    void *isa;
+    int32_t flags;
+    int32_t reserved;
+    BlockInvokeFn invoke;
+    void *descriptor;
+};
 
 #pragma mark - Cryptographic Helpers
 
@@ -210,38 +222,24 @@ static void hooked_b5Znk9Kh(id self, SEL _cmd, id params, id path, id successBlo
     if ([pathStr containsString:@"loginip"] || [pathStr containsString:@"redeem"]) {
         NSData *response = SynthesizePhase1Response((NSDictionary *)params);
         if (successBlock && response) {
-            dispatch_async(dispatch_get_main_queue(), ^{
-                @try {
-                    NSLog(LOG_TAG @"Dispatching synthesized response into successBlock...");
-                    //
-                    // CRITICAL ABI FIX:
-                    // In ARM64, the block implementation sub_1006A77C0 reads register X2 as the response NSData!
-                    // Calling (response, response) places response into BOTH X1 and X2, completely eliminating
-                    // register mismatch and preventing objc_retain crash on invalid status codes!
-                    //
-                    void (^block)(id, id) = (void (^)(id, id))successBlock;
-                    block(response, response);
-                    NSLog(LOG_TAG @"[SUCCESS] successBlock executed cleanly without errors!");
-                } @catch (NSException *ex) {
-                    NSLog(LOG_TAG @"Exception calling successBlock: %@", ex);
-                }
-            });
-            return;
+            NSLog(LOG_TAG @"Directly invoking successBlock synchronously (Stack Frame Alive)...");
+            struct CustomBlockLayout *b = (__bridge struct CustomBlockLayout *)successBlock;
+            if (b && b->invoke) {
+                b->invoke(b, response, response);
+                NSLog(LOG_TAG @"[SUCCESS] Phase 1 successBlock returned cleanly! UI should now be unlocked.");
+                return;
+            }
         }
     } else if ([pathStr containsString:@"team"] || [pathStr containsString:@"X2.1Public"]) {
         NSData *response = SynthesizePhase2Response((NSDictionary *)params);
         if (successBlock && response) {
-            dispatch_async(dispatch_get_main_queue(), ^{
-                @try {
-                    NSLog(LOG_TAG @"Dispatching Phase 2 response into successBlock...");
-                    void (^block)(id, id) = (void (^)(id, id))successBlock;
-                    block(response, response);
-                    NSLog(LOG_TAG @"[SUCCESS] Phase 2 block executed cleanly!");
-                } @catch (NSException *ex) {
-                    NSLog(LOG_TAG @"Exception in Phase 2 block: %@", ex);
-                }
-            });
-            return;
+            NSLog(LOG_TAG @"Directly invoking Phase 2 successBlock synchronously...");
+            struct CustomBlockLayout *b = (__bridge struct CustomBlockLayout *)successBlock;
+            if (b && b->invoke) {
+                b->invoke(b, response, response);
+                NSLog(LOG_TAG @"[SUCCESS] Phase 2 block returned cleanly!");
+                return;
+            }
         }
     }
 
@@ -271,9 +269,7 @@ static NSURLSessionDataTask *hooked_dataTaskWithRequest(id self, SEL _cmd, NSURL
                                                                           statusCode:200
                                                                          HTTPVersion:@"HTTP/1.1"
                                                                         headerFields:@{@"Content-Type": @"text/html; charset=UTF-8"}];
-            dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-                handler(responseBody, httpResponse, nil);
-            });
+            handler(responseBody, httpResponse, nil);
         }
         return nil;
     }
