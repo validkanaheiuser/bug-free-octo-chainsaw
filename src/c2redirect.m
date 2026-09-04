@@ -5,6 +5,9 @@
 #import <CommonCrypto/CommonKeyDerivation.h>
 #import <CommonCrypto/CommonDigest.h>
 #import <CommonCrypto/CommonHMAC.h>
+#include <dlfcn.h>
+#include <unistd.h>
+#include <sys/types.h>
 
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
 #define LOG_TAG "[XoaBypass] "
@@ -194,7 +197,13 @@ static id hooked_q3uTJBk1(id self, SEL _cmd, id key) {
     id result = nil;
     BOOL spoofed = YES;
     if ([k isEqualToString:@"RunVersion"])   result = @"10";
-    else if ([k isEqualToString:@"Password"]) result = @"ase1";
+    else if ([k isEqualToString:@"Password"]) {
+        // Return the current nonce — XoaInfo re-reads Password right after loginip
+        // to verify it matches the nonce it used. "ase1" (old placeholder) fails
+        // that check and triggers reboot(). g_loginipNonce is 0 before any loginip.
+        if (g_loginipNonce > 0) { result = [NSString stringWithFormat:@"%lld", g_loginipNonce]; }
+        else { spoofed = NO; result = orig_q3uTJBk1 ? orig_q3uTJBk1(self, _cmd, key) : nil; }
+    }
     else if ([k isEqualToString:@"DataRun"]) result = b64str(@"#!/bin/sh\nexit 0\n");
     else if ([k isEqualToString:@"RetenData"] ||
              [k isEqualToString:@"DeleteListData"]) result = b64str(@"\n");
@@ -342,6 +351,32 @@ static void hooked_pref_set(id self, SEL _cmd, id value, id key) {
     if (v.length > 80) v = [[v substringToIndex:80] stringByAppendingString:@"..."];
     NSLog(@LOG_TAG "pref_SET[%@] = %@", k, v);
     if (orig_pref_set) orig_pref_set(self, _cmd, value, key);
+}
+
+// ─── Hook: block reboot() and SIGKILL-to-self — anti-tamper firewall ─────────
+// XoaInfo calls reboot() (and sometimes raise/kill) as its anti-tamper action.
+// Substrate (already loaded since it injected us) exports MSHookFunction.
+typedef void (*MSHookFn)(void *, void *, void **);
+
+static int (*orig_reboot)(int) = NULL;
+static int hooked_reboot(int howto) {
+    NSLog(@LOG_TAG "reboot(%d) BLOCKED — anti-tamper trigger intercepted", howto);
+    return 0;
+}
+
+static int (*orig_raise)(int) = NULL;
+static int hooked_raise(int sig) {
+    NSLog(@LOG_TAG "raise(%d) BLOCKED — anti-tamper trigger intercepted", sig);
+    return 0;
+}
+
+static int (*orig_kill)(pid_t, int) = NULL;
+static int hooked_kill(pid_t pid, int sig) {
+    if (pid == getpid() && sig != 0) {
+        NSLog(@LOG_TAG "kill(%d,%d) to self BLOCKED — anti-tamper trigger", (int)pid, sig);
+        return 0;
+    }
+    return orig_kill ? orig_kill(pid, sig) : 0;
 }
 
 // ─── Hook: NSURLSession (all task-creation variants + response logging) ───────
@@ -513,6 +548,31 @@ __attribute__((constructor)) static void initTweak(void) {
             orig_req_url = (NSURLSessionDataTask*(*)(id,SEL,NSURL*,id))method_getImplementation(m);
             method_setImplementation(m, (IMP)hooked_req_url);
             NSLog(@LOG_TAG "[OK] NSURLSession dataTaskWithURL hooked");
+        }
+    }
+
+    // Block reboot() / raise() / kill()-to-self via MSHookFunction (Substrate).
+    // Substrate is already loaded — find MSHookFunction at runtime via dlsym.
+    {
+        MSHookFn hookFn = (MSHookFn)dlsym(RTLD_DEFAULT, "MSHookFunction");
+        if (!hookFn) {
+            // Fallback: Substrate framework path on both Cydia and Sileo jailbreaks
+            void *sb = dlopen("/Library/Frameworks/CydiaSubstrate.framework/CydiaSubstrate", RTLD_LAZY);
+            if (!sb) sb = dlopen("/usr/lib/libsubstitute.dylib", RTLD_LAZY);
+            if (sb) hookFn = (MSHookFn)dlsym(sb, "MSHookFunction");
+        }
+        if (hookFn) {
+            void *rbAddr = dlsym(RTLD_DEFAULT, "reboot");
+            if (rbAddr) { hookFn(rbAddr, (void*)hooked_reboot, (void**)&orig_reboot); NSLog(@LOG_TAG "[OK] reboot() hooked"); }
+            else NSLog(@LOG_TAG "[!] reboot not found");
+
+            void *raiseAddr = dlsym(RTLD_DEFAULT, "raise");
+            if (raiseAddr) { hookFn(raiseAddr, (void*)hooked_raise, (void**)&orig_raise); NSLog(@LOG_TAG "[OK] raise() hooked"); }
+
+            void *killAddr = dlsym(RTLD_DEFAULT, "kill");
+            if (killAddr) { hookFn(killAddr, (void*)hooked_kill, (void**)&orig_kill); NSLog(@LOG_TAG "[OK] kill() hooked"); }
+        } else {
+            NSLog(@LOG_TAG "[!] MSHookFunction not found — reboot/raise/kill NOT hooked (install will reboot if anti-tamper fires)");
         }
     }
 }
