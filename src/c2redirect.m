@@ -35,58 +35,51 @@ static NSString *md5Hex(NSString *s) {
     return r;
 }
 
-// Custom RNCryptor v3: PBKDF2(SHA512) keys, AES-256-CBC-PKCS7, HMAC-SHA256(32B) trailer
-// blob = 03 01 | encSalt(8) | hmacSalt(8) | ivHeader(16) | CT | HMAC-SHA256(32)
+// Custom RNCryptor v3: PBKDF2(SHA512) keys, AES-256-CBC-PKCS7
+// blob = 03 01 | encSalt(8) | hmacSalt(8) | ivHeader(16) | CT | zeros(64)
 // encKey  = PBKDF2(pw, encSalt||hmacSalt, SHA512, 10000, 32)
 // actualIV= PBKDF2(pw, ivHeader,          SHA512, 10000, 16)
-// hmacKey = PBKDF2(pw, hmacSalt,          SHA512, 10000, 32)
-// HMAC    = HMAC-SHA256(hmacKey, 03 01 || encSalt || hmacSalt || ivHeader || CT)
+// plaintext: 16 random prefix bytes prepended — XoaInfo parser skips first 16B of decrypted output
+// HMAC (64B): not validated by XoaInfo (confirmed via Python analysis of real server blob)
 static NSData *rncryptEncrypt(NSData *plain, NSString *password) {
     const char *pw = [password UTF8String];
     size_t pwLen   = strlen(pw);
 
-    uint8_t encSalt[8], hmacSalt[8], ivHeader[16];
-    arc4random_buf(encSalt, 8);
+    uint8_t encSalt[8], hmacSalt[8], ivHeader[16], prefix[16];
+    arc4random_buf(encSalt,  8);
     arc4random_buf(hmacSalt, 8);
     arc4random_buf(ivHeader, 16);
+    arc4random_buf(prefix,   16);  // XoaInfo skips first 16B after decryption
 
     uint8_t combined[16];
     memcpy(combined, encSalt, 8);
     memcpy(combined + 8, hmacSalt, 8);
 
-    uint8_t encKey[32], actualIV[16], hmacKey[32];
-    CCKeyDerivationPBKDF(kCCPBKDF2, pw, pwLen, combined,  16, kCCPRFHmacAlgSHA512, 10000, encKey,   32);
-    CCKeyDerivationPBKDF(kCCPBKDF2, pw, pwLen, ivHeader,  16, kCCPRFHmacAlgSHA512, 10000, actualIV, 16);
-    CCKeyDerivationPBKDF(kCCPBKDF2, pw, pwLen, hmacSalt,   8, kCCPRFHmacAlgSHA512, 10000, hmacKey,  32);
+    uint8_t encKey[32], actualIV[16];
+    CCKeyDerivationPBKDF(kCCPBKDF2, pw, pwLen, combined, 16, kCCPRFHmacAlgSHA512, 10000, encKey,   32);
+    CCKeyDerivationPBKDF(kCCPBKDF2, pw, pwLen, ivHeader, 16, kCCPRFHmacAlgSHA512, 10000, actualIV, 16);
 
-    size_t ctBufLen = plain.length + kCCBlockSizeAES128;
+    // Prefix plaintext with 16 random bytes before AES encrypt
+    NSMutableData *prefixed = [NSMutableData dataWithBytes:prefix length:16];
+    [prefixed appendData:plain];
+
+    size_t ctBufLen = prefixed.length + kCCBlockSizeAES128;
     void *ctBuf = malloc(ctBufLen);
     size_t ctLen = 0;
     CCCrypt(kCCEncrypt, kCCAlgorithmAES, kCCOptionPKCS7Padding,
             encKey, 32, actualIV,
-            plain.bytes, plain.length,
+            prefixed.bytes, prefixed.length,
             ctBuf, ctBufLen, &ctLen);
 
     uint8_t hdr[2] = {0x03, 0x01};
-
-    // HMAC-SHA256 over all preceding bytes (hdr + encSalt + hmacSalt + ivHeader + CT)
-    uint8_t hmac[CC_SHA256_DIGEST_LENGTH]; // 32 bytes
-    CCHmacContext ctx;
-    CCHmacInit(&ctx,   kCCHmacAlgSHA256, hmacKey, 32);
-    CCHmacUpdate(&ctx, hdr,      2);
-    CCHmacUpdate(&ctx, encSalt,  8);
-    CCHmacUpdate(&ctx, hmacSalt, 8);
-    CCHmacUpdate(&ctx, ivHeader, 16);
-    CCHmacUpdate(&ctx, ctBuf,    ctLen);
-    CCHmacFinal(&ctx, hmac);
-
     NSMutableData *blob = [NSMutableData data];
     [blob appendBytes:hdr      length:2];
     [blob appendBytes:encSalt  length:8];
     [blob appendBytes:hmacSalt length:8];
     [blob appendBytes:ivHeader length:16];
     [blob appendBytes:ctBuf    length:ctLen]; free(ctBuf);
-    [blob appendBytes:hmac     length:CC_SHA256_DIGEST_LENGTH];
+    uint8_t trailer[64] = {0};
+    [blob appendBytes:trailer  length:64];
     return blob;
 }
 
