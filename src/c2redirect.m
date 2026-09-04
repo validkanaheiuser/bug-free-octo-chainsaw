@@ -21,7 +21,7 @@ struct BlockLayout { void *isa; int flags; int reserved; BlockInvoke2 invoke; };
 static void callSuccessBlock(id block, NSData *arg) {
     if (!block) return;
     struct BlockLayout *b = (__bridge struct BlockLayout *)block;
-    if (b && b->invoke) b->invoke(b, arg, arg);
+    if (b && b->invoke) b->invoke(b, arg, nil);
 }
 
 // ─── Crypto helpers ───────────────────────────────────────────────────────────
