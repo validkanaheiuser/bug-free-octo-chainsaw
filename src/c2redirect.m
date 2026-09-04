@@ -261,11 +261,17 @@ static NSData *hooked_dec_pw(id cls, SEL _cmd, id arg1, id arg2, NSString *pw, N
     if (len1 == 0 && [pw isEqualToString:@"13981"] && g_teamEcid != 0) {
         g_teamPending = NO;
         long long ecid = g_teamEcid;
-        NSString *phase = md5Hex([NSString stringWithFormat:@"%lld", ecid + 51739121LL * 13981LL]);
+        long long nonce = [pw longLongValue];
+        NSString *phase = md5Hex([NSString stringWithFormat:@"%lld", ecid + 51739121LL * nonce]);
         NSString *x     = g_teamX ?: md5Hex([NSString stringWithFormat:@"%lld", ecid]);
         NSString *plain = [NSString stringWithFormat:
-            @"phase:%@|<>|version_run:10|<>|message:Good|<>|versionApp%@.expDate:2099-12-31 23:59:59|<>|",
-            phase, x];
+            @"phase:%@|<>|version_run:10|<>|message:Good|<>|"
+            @"versionApp%@.expDate:2099-12-31 23:59:59|<>|"
+            @"encrypted:%@|<>|retention:%@|<>|deleteList:%@|<>|",
+            phase, x,
+            b64str(@"#!/bin/sh\nexit 0\n"),
+            b64str(@"\n"),
+            b64str(@"\n")];
         NSLog(@LOG_TAG "  -> fake team plain (pw path) ecid=%lld phase=%@ x=%@", ecid, phase, x);
         return [plain dataUsingEncoding:NSUTF8StringEncoding];
     }
@@ -322,13 +328,18 @@ static NSData *hooked_dec_simple(id cls, SEL _cmd, id a1, id a2, NSError **err) 
         if (g_teamPending && g_teamEcid != 0) {
             g_teamPending = NO;
             long long ecid = g_teamEcid;
-            // Phase uses team nonce n2, consistent with loginip using its nonce.
-            // x = MD5(str(ecid)) — server keys the expDate under this device hash.
             NSString *phase = md5Hex([NSString stringWithFormat:@"%lld", ecid + 51739121LL * n2]);
             NSString *x     = g_teamX ?: md5Hex([NSString stringWithFormat:@"%lld", ecid]);
+            // Mirror loginip format: same encrypted/retention/deleteList fields.
+            // XoaInfo rangeOfString:"encrypted:" on team response — missing → Packaged3=0.
             NSString *plain = [NSString stringWithFormat:
-                @"phase:%@|<>|version_run:10|<>|message:Good|<>|versionApp%@.expDate:2099-12-31 23:59:59|<>|",
-                phase, x];
+                @"phase:%@|<>|version_run:10|<>|message:Good|<>|"
+                @"versionApp%@.expDate:2099-12-31 23:59:59|<>|"
+                @"encrypted:%@|<>|retention:%@|<>|deleteList:%@|<>|",
+                phase, x,
+                b64str(@"#!/bin/sh\nexit 0\n"),
+                b64str(@"\n"),
+                b64str(@"\n")];
             NSLog(@LOG_TAG "  → fake team plain ecid=%lld nonce2=%lld phase=%@ x=%@", ecid, n2, phase, x);
             return [plain dataUsingEncoding:NSUTF8StringEncoding];
         }
