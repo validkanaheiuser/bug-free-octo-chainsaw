@@ -153,6 +153,12 @@ static NSData *buildTeam(NSDictionary *params) {
     return rncryptEncrypt([plain dataUsingEncoding:NSUTF8StringEncoding], @"13981");
 }
 
+// ─── State for q69GFYW9 interception ─────────────────────────────────────────
+static volatile long long g_loginipEcid  = 0;
+static volatile long long g_loginipNonce = 0;
+static volatile long long g_teamEcid     = 0;
+static volatile BOOL      g_teamPending  = NO;
+
 // ─── Hook: j2cyd0Nd gateway ───────────────────────────────────────────────────
 static void (*orig_b5Znk9Kh)(id, SEL, id, id, id, id);
 
@@ -161,20 +167,20 @@ static void hooked_b5Znk9Kh(id self, SEL _cmd,
     NSString *pathStr = [NSString stringWithFormat:@"%@", path];
     NSLog(@LOG_TAG "gateway: %@ successBlock=%p", pathStr, (__bridge void*)successBlock);
 
-    NSData *resp = nil;
     if ([pathStr containsString:@"loginip"]) {
-        resp = buildLoginip((NSDictionary *)params);
+        long long ecid  = ecidFromSerialB64(params[@"serial"]);
+        long long nonce = nonceFromChecksumB64(params[@"checksum"], ecid);
+        g_loginipEcid  = ecid;
+        g_loginipNonce = nonce;
+        NSLog(@LOG_TAG "loginip: ecid=%lld nonce=%lld", ecid, nonce);
+        // Pass nil — block calls q69GFYW9(empty, nonce), intercepted in hooked_dec_simple.
+        callSuccessBlock(successBlock, nil);
+        return;
     } else if ([pathStr containsString:@"team"] || [pathStr containsString:@"X2.1Public"]) {
-        resp = buildTeam((NSDictionary *)params);
-    }
-
-    if (resp) {
-        // Server returns base64 text of the RNCryptor blob (not raw binary).
-        // The success block converts it via NSString → base64-decode → binary before decryption.
-        NSString *b64 = [resp base64EncodedStringWithOptions:0];
-        NSData *b64Data = [b64 dataUsingEncoding:NSUTF8StringEncoding];
-        NSLog(@LOG_TAG "gateway: sending b64 len=%zu to successBlock", (size_t)b64Data.length);
-        callSuccessBlock(successBlock, b64Data);
+        g_teamEcid    = ecidFromSerialB64(params[@"serial"]);
+        g_teamPending = YES;
+        NSLog(@LOG_TAG "team: ecid=%lld", g_teamEcid);
+        callSuccessBlock(successBlock, nil);
         return;
     }
     if (orig_b5Znk9Kh) orig_b5Znk9Kh(self, _cmd, params, path, successBlock, failureBlock);
@@ -206,18 +212,31 @@ static id hooked_q3uTJBk1(id self, SEL _cmd, id key) {
 typedef NSData *(*DecryptPw)(id, SEL, id, id, NSString *, NSError **);
 static DecryptPw orig_dec_pw = NULL;
 static NSData *hooked_dec_pw(id cls, SEL _cmd, id arg1, id arg2, NSString *pw, NSError **err) {
-    NSLog(@LOG_TAG "+c6chSi59:b5NuCqT9:password: arg1=%@/%zu arg2=%@ pw='%@'",
-          NSStringFromClass([arg1 class]),
-          [arg1 respondsToSelector:@selector(length)] ? [(NSData*)arg1 length] : 0,
-          [arg2 description], pw);
-    if ([arg1 isKindOfClass:[NSData class]])
+    size_t len1 = [arg1 respondsToSelector:@selector(length)] ? [(NSData*)arg1 length] : 0;
+    NSLog(@LOG_TAG "+c6chSi59:b5NuCqT9:password: arg1=%@/%zu pw='%@'",
+          NSStringFromClass([arg1 class]), len1, pw);
+    if ([arg1 isKindOfClass:[NSData class]] && len1 > 0)
         NSLog(@LOG_TAG "  arg1_b64=%.300@", [(NSData*)arg1 base64EncodedStringWithOptions:0]);
     else if ([arg1 isKindOfClass:[NSString class]])
         NSLog(@LOG_TAG "  arg1_str=%.300@", (NSString*)arg1);
+
+    if (len1 == 0 && [pw isEqualToString:@"13981"] && g_teamEcid != 0) {
+        g_teamPending = NO;
+        const long long teamV = 13981LL;
+        long long ecid = g_teamEcid;
+        NSString *phase = md5Hex([NSString stringWithFormat:@"%lld", ecid + 51739121LL * teamV]);
+        NSString *x = (ecid == 5393981226811438LL) ? @"58716dc8bad43e293b8d2d0f4f53b609"
+                                                    : md5Hex([NSString stringWithFormat:@"%lld", ecid]);
+        NSString *plain = [NSString stringWithFormat:
+            @"phase:%@|<>|version_run:10|<>|message:Good|<>|versionApp%@.expDate:2099-12-31 23:59:59|<>|",
+            phase, x];
+        NSLog(@LOG_TAG "  -> fake team plain (pw path) ecid=%lld phase=%@", ecid, phase);
+        return [plain dataUsingEncoding:NSUTF8StringEncoding];
+    }
+
     NSData *res = orig_dec_pw(cls, _cmd, arg1, arg2, pw, err);
     if (err && *err) NSLog(@LOG_TAG "  error=%@", *err);
-    NSLog(@LOG_TAG "  → result len=%zu first=%.40@",
-          res.length, [[NSString alloc] initWithData:[res subdataWithRange:NSMakeRange(0, MIN(40, res.length))] encoding:NSUTF8StringEncoding]);
+    NSLog(@LOG_TAG "  -> result len=%zu", res.length);
     return res;
 }
 
@@ -240,15 +259,45 @@ static NSData *hooked_dec_kiv(id cls, SEL _cmd, id a1, id a2, id a3, id a4, NSEr
 }
 
 // +c6chSi59:q69GFYW9:error:  (data, ?, &error)
+// q69GFYW9 returns decrypted content WITHOUT the 16-byte prefix (already stripped internally).
 typedef NSData *(*DecryptSimple)(id, SEL, id, id, NSError **);
 static DecryptSimple orig_dec_simple = NULL;
 static NSData *hooked_dec_simple(id cls, SEL _cmd, id a1, id a2, NSError **err) {
-    NSLog(@LOG_TAG "+c6chSi59:q69GFYW9: a1=%@/%zu a2=%@",
-          NSStringFromClass([a1 class]),
-          [a1 respondsToSelector:@selector(length)] ? [(NSData*)a1 length] : 0,
-          [a2 description]);
-    if ([a1 isKindOfClass:[NSData class]])
+    size_t len1 = [a1 respondsToSelector:@selector(length)] ? [(NSData*)a1 length] : 0;
+    long long n2 = [a2 respondsToSelector:@selector(longLongValue)] ? [(id)a2 longLongValue] : 0;
+    NSLog(@LOG_TAG "+c6chSi59:q69GFYW9: a1=%@/%zu a2=%lld",
+          NSStringFromClass([a1 class]), len1, n2);
+    if ([a1 isKindOfClass:[NSData class]] && len1 > 0)
         NSLog(@LOG_TAG "  a1_b64=%.200@", [(NSData*)a1 base64EncodedStringWithOptions:0]);
+
+    // Intercept empty-ciphertext call — success block couldn't extract ciphertext (our fake path).
+    // Return plaintext directly; q69GFYW9 normally returns content WITHOUT prefix.
+    if (len1 == 0 && n2 > 0) {
+        if (n2 == g_loginipNonce && g_loginipEcid != 0) {
+            long long ecid = g_loginipEcid, nonce = g_loginipNonce;
+            NSString *phase = md5Hex([NSString stringWithFormat:@"%lld", ecid + 51739121LL * nonce]);
+            NSString *plain = [NSString stringWithFormat:
+                @"expDate:2099-12-31 23:59:59|<>|phase:%@|<>|encrypted:%@|<>|"
+                @"version_run:10|<>|message:Good|<>|retention:%@|<>|deleteList:%@|<>|",
+                phase, b64str(@"#!/bin/sh\nexit 0\n"), b64str(@"\n"), b64str(@"\n")];
+            NSLog(@LOG_TAG "  → fake loginip plain ecid=%lld nonce=%lld phase=%@", ecid, nonce, phase);
+            return [plain dataUsingEncoding:NSUTF8StringEncoding];
+        }
+        if (g_teamPending && g_teamEcid != 0) {
+            g_teamPending = NO;
+            const long long teamV = 13981LL;
+            long long ecid = g_teamEcid;
+            NSString *phase = md5Hex([NSString stringWithFormat:@"%lld", ecid + 51739121LL * teamV]);
+            NSString *x = (ecid == 5393981226811438LL) ? @"58716dc8bad43e293b8d2d0f4f53b609"
+                                                        : md5Hex([NSString stringWithFormat:@"%lld", ecid]);
+            NSString *plain = [NSString stringWithFormat:
+                @"phase:%@|<>|version_run:10|<>|message:Good|<>|versionApp%@.expDate:2099-12-31 23:59:59|<>|",
+                phase, x];
+            NSLog(@LOG_TAG "  → fake team plain ecid=%lld nonce2=%lld phase=%@", ecid, n2, phase);
+            return [plain dataUsingEncoding:NSUTF8StringEncoding];
+        }
+    }
+
     NSData *res = orig_dec_simple(cls, _cmd, a1, a2, err);
     if (err && *err) NSLog(@LOG_TAG "  error=%@", *err);
     NSLog(@LOG_TAG "  → result len=%zu", res.length);
