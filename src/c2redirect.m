@@ -258,12 +258,12 @@ static NSData *hooked_dec_pw(id cls, SEL _cmd, id arg1, id arg2, NSString *pw, N
     else if ([arg1 isKindOfClass:[NSString class]])
         NSLog(@LOG_TAG "  arg1_str=%.300@", (NSString*)arg1);
 
-    if (len1 == 0 && [pw isEqualToString:@"13981"] && g_teamEcid != 0) {
+    if (len1 == 0 && g_teamPending && g_teamEcid != 0) {
         g_teamPending = NO;
-        long long ecid = g_teamEcid;
-        long long nonce = [pw longLongValue];
-        NSString *phase = md5Hex([NSString stringWithFormat:@"%lld", ecid + 51739121LL * nonce]);
-        NSString *x     = g_teamX ?: md5Hex([NSString stringWithFormat:@"%lld", ecid]);
+        long long ecid   = g_teamEcid;
+        long long pnonce = (g_loginipNonce > 0) ? g_loginipNonce : [pw longLongValue];
+        NSString *phase  = md5Hex([NSString stringWithFormat:@"%lld", ecid + 51739121LL * pnonce]);
+        NSString *x      = g_teamX ?: md5Hex([NSString stringWithFormat:@"%lld", ecid]);
         NSString *plain = [NSString stringWithFormat:
             @"phase:%@|<>|version_run:10|<>|message:Good|<>|"
             @"versionApp%@.expDate:2099-12-31 23:59:59|<>|"
@@ -272,7 +272,7 @@ static NSData *hooked_dec_pw(id cls, SEL _cmd, id arg1, id arg2, NSString *pw, N
             b64str(@"#!/bin/sh\nexit 0\n"),
             b64str(@"\n"),
             b64str(@"\n")];
-        NSLog(@LOG_TAG "  -> fake team plain (pw path) ecid=%lld phase=%@ x=%@", ecid, phase, x);
+        NSLog(@LOG_TAG "  -> fake team plain (pw path) ecid=%lld loginipNonce=%lld phase=%@ x=%@", ecid, pnonce, phase, x);
         return [plain dataUsingEncoding:NSUTF8StringEncoding];
     }
 
@@ -327,9 +327,11 @@ static NSData *hooked_dec_simple(id cls, SEL _cmd, id a1, id a2, NSError **err) 
         }
         if (g_teamPending && g_teamEcid != 0) {
             g_teamPending = NO;
-            long long ecid = g_teamEcid;
-            NSString *phase = md5Hex([NSString stringWithFormat:@"%lld", ecid + 51739121LL * n2]);
-            NSString *x     = g_teamX ?: md5Hex([NSString stringWithFormat:@"%lld", ecid]);
+            long long ecid   = g_teamEcid;
+            // team phase uses loginip nonce (same as params["user"]) — server uses user field.
+            long long pnonce = (g_loginipNonce > 0) ? g_loginipNonce : n2;
+            NSString *phase  = md5Hex([NSString stringWithFormat:@"%lld", ecid + 51739121LL * pnonce]);
+            NSString *x      = g_teamX ?: md5Hex([NSString stringWithFormat:@"%lld", ecid]);
             // Mirror loginip format: same encrypted/retention/deleteList fields.
             // XoaInfo rangeOfString:"encrypted:" on team response — missing → Packaged3=0.
             NSString *plain = [NSString stringWithFormat:
@@ -340,7 +342,7 @@ static NSData *hooked_dec_simple(id cls, SEL _cmd, id a1, id a2, NSError **err) 
                 b64str(@"#!/bin/sh\nexit 0\n"),
                 b64str(@"\n"),
                 b64str(@"\n")];
-            NSLog(@LOG_TAG "  → fake team plain ecid=%lld nonce2=%lld phase=%@ x=%@", ecid, n2, phase, x);
+            NSLog(@LOG_TAG "  → fake team plain ecid=%lld loginipNonce=%lld phase=%@ x=%@", ecid, pnonce, phase, x);
             return [plain dataUsingEncoding:NSUTF8StringEncoding];
         }
     }
