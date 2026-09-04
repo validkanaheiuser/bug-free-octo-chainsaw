@@ -181,6 +181,9 @@ static volatile long long g_loginipEcid  = 0;
 static volatile long long g_loginipNonce = 0;
 static volatile long long g_teamEcid     = 0;
 static volatile BOOL      g_teamPending  = NO;
+// x = hash field from team params (e.g. "0a372322..."), stripped of "0x" and lowercased.
+// Server keys versionApp{x}.expDate under this device hash, NOT md5(ecid).
+static NSString          *g_teamX        = nil;
 
 // ─── Hook: j2cyd0Nd gateway ───────────────────────────────────────────────────
 static void (*orig_b5Znk9Kh)(id, SEL, id, id, id, id);
@@ -202,8 +205,13 @@ static void hooked_b5Znk9Kh(id self, SEL _cmd,
     } else if ([pathStr containsString:@"team"] || [pathStr containsString:@"X2.1Public"]) {
         g_teamEcid    = ecidFromSerialB64(params[@"serial"]);
         g_teamPending = YES;
-        // Log all team request params so we can see the nonce/checksum
-        NSLog(@LOG_TAG "team: ecid=%lld params=%@", g_teamEcid, params);
+        // x = device hash from params — server keys versionApp{x}.expDate under this.
+        // Strip "0x"/"0X" prefix and lowercase to match the key format.
+        NSString *hashRaw = [NSString stringWithFormat:@"%@", params[@"hash"]];
+        if ([hashRaw hasPrefix:@"0x"] || [hashRaw hasPrefix:@"0X"])
+            hashRaw = [hashRaw substringFromIndex:2];
+        g_teamX = [hashRaw lowercaseString];
+        NSLog(@LOG_TAG "team: ecid=%lld x=%@ user=%@ params=%@", g_teamEcid, g_teamX, params[@"user"], params);
         callSuccessBlock(successBlock, nil);
         return;
     }
@@ -254,11 +262,11 @@ static NSData *hooked_dec_pw(id cls, SEL _cmd, id arg1, id arg2, NSString *pw, N
         g_teamPending = NO;
         long long ecid = g_teamEcid;
         NSString *phase = md5Hex([NSString stringWithFormat:@"%lld", ecid + 51739121LL * 13981LL]);
-        NSString *x     = md5Hex([NSString stringWithFormat:@"%lld", ecid]);
+        NSString *x     = g_teamX ?: md5Hex([NSString stringWithFormat:@"%lld", ecid]);
         NSString *plain = [NSString stringWithFormat:
             @"phase:%@|<>|version_run:10|<>|message:Good|<>|versionApp%@.expDate:2099-12-31 23:59:59|<>|",
             phase, x];
-        NSLog(@LOG_TAG "  -> fake team plain (pw path) ecid=%lld phase=%@", ecid, phase);
+        NSLog(@LOG_TAG "  -> fake team plain (pw path) ecid=%lld phase=%@ x=%@", ecid, phase, x);
         return [plain dataUsingEncoding:NSUTF8StringEncoding];
     }
 
@@ -317,7 +325,7 @@ static NSData *hooked_dec_simple(id cls, SEL _cmd, id a1, id a2, NSError **err) 
             // Phase uses team nonce n2, consistent with loginip using its nonce.
             // x = MD5(str(ecid)) — server keys the expDate under this device hash.
             NSString *phase = md5Hex([NSString stringWithFormat:@"%lld", ecid + 51739121LL * n2]);
-            NSString *x     = md5Hex([NSString stringWithFormat:@"%lld", ecid]);
+            NSString *x     = g_teamX ?: md5Hex([NSString stringWithFormat:@"%lld", ecid]);
             NSString *plain = [NSString stringWithFormat:
                 @"phase:%@|<>|version_run:10|<>|message:Good|<>|versionApp%@.expDate:2099-12-31 23:59:59|<>|",
                 phase, x];
