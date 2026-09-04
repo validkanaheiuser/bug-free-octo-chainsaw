@@ -6,11 +6,31 @@
 #import <CommonCrypto/CommonDigest.h>
 #import <CommonCrypto/CommonHMAC.h>
 #include <dlfcn.h>
-#include <unistd.h>
-#include <sys/types.h>
 
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
 #define LOG_TAG "[XoaBypass] "
+
+// ─── MSHookFunction via ElleKit (no link-time dependency) ────────────────────
+// XoaInfo's state machine calls method_getImplementation and verifies the IMP
+// matches the expected (pre-hook) value. method_setImplementation changes the
+// IMP slot and triggers the anti-tamper. MSHookFunction patches only the
+// function body, leaving the Method struct IMP unchanged → verifier passes.
+typedef void (*MSHookFunction_t)(void *symbol, void *hook, void **old);
+static MSHookFunction_t _mshook = NULL;
+
+static void hookImp(Method m, void *hook, void **orig, const char *tag) {
+    if (!m) { NSLog(@LOG_TAG "[!] hookImp: null Method for %s", tag); return; }
+    void *imp = (void *)method_getImplementation(m);
+    if (_mshook) {
+        _mshook(imp, hook, orig);
+        NSLog(@LOG_TAG "[MSHook] %s @ %p", tag, imp);
+    } else {
+        // Fallback (will trigger anti-tamper, but records fact for debugging)
+        *orig = imp;
+        method_setImplementation(m, (IMP)hook);
+        NSLog(@LOG_TAG "[WARN method_setImpl fallback] %s", tag);
+    }
+}
 
 // ─── Block ABI ───────────────────────────────────────────────────────────────
 typedef void (*BlockInvoke2)(void *, id, id);
@@ -353,32 +373,6 @@ static void hooked_pref_set(id self, SEL _cmd, id value, id key) {
     if (orig_pref_set) orig_pref_set(self, _cmd, value, key);
 }
 
-// ─── Hook: block reboot() and SIGKILL-to-self — anti-tamper firewall ─────────
-// XoaInfo calls reboot() (and sometimes raise/kill) as its anti-tamper action.
-// Substrate (already loaded since it injected us) exports MSHookFunction.
-typedef void (*MSHookFn)(void *, void *, void **);
-
-static int (*orig_reboot)(int) = NULL;
-static int hooked_reboot(int howto) {
-    NSLog(@LOG_TAG "reboot(%d) BLOCKED — anti-tamper trigger intercepted", howto);
-    return 0;
-}
-
-static int (*orig_raise)(int) = NULL;
-static int hooked_raise(int sig) {
-    NSLog(@LOG_TAG "raise(%d) BLOCKED — anti-tamper trigger intercepted", sig);
-    return 0;
-}
-
-static int (*orig_kill)(pid_t, int) = NULL;
-static int hooked_kill(pid_t pid, int sig) {
-    if (pid == getpid() && sig != 0) {
-        NSLog(@LOG_TAG "kill(%d,%d) to self BLOCKED — anti-tamper trigger", (int)pid, sig);
-        return 0;
-    }
-    return orig_kill ? orig_kill(pid, sig) : 0;
-}
-
 // ─── Hook: NSURLSession (all task-creation variants + response logging) ───────
 typedef void (^CompHandler)(NSData *, NSURLResponse *, NSError *);
 
@@ -427,28 +421,26 @@ static NSURLSessionDataTask *hooked_req_url(id self, SEL _cmd, NSURL *url, id or
 
 // ─── Constructor ─────────────────────────────────────────────────────────────
 __attribute__((constructor)) static void initTweak(void) {
-    NSLog(@LOG_TAG "=== XoaInfo Fake Auth Loaded (debug2) ===");
+    NSLog(@LOG_TAG "=== XoaInfo Fake Auth Loaded (debug3) ===");
+
+    // Resolve MSHookFunction from ElleKit (loaded as Depends: ellekit).
+    // Using RTLD_DEFAULT searches all already-loaded dylibs — no link needed.
+    _mshook = (MSHookFunction_t)dlsym(RTLD_DEFAULT, "MSHookFunction");
+    if (_mshook) NSLog(@LOG_TAG "[OK] MSHookFunction resolved @ %p", (void*)_mshook);
+    else         NSLog(@LOG_TAG "[!] MSHookFunction not found — fallback to method_setImpl (WILL trigger anti-tamper)");
 
     // j2cyd0Nd gateway
     Class gw = objc_getClass("j2cyd0Nd");
     if (gw) {
         Method m = class_getInstanceMethod(gw, sel_registerName("b5Znk9Kh:q7C9eMnf:c7UND7t6:z0BQnrZN:"));
-        if (m) {
-            orig_b5Znk9Kh = (void(*)(id,SEL,id,id,id,id))method_getImplementation(m);
-            method_setImplementation(m, (IMP)hooked_b5Znk9Kh);
-            NSLog(@LOG_TAG "[OK] j2cyd0Nd gateway hooked");
-        } else { NSLog(@LOG_TAG "[!] j2cyd0Nd method not found"); }
+        hookImp(m, (void*)hooked_b5Znk9Kh, (void**)&orig_b5Znk9Kh, "j2cyd0Nd gateway");
     } else { NSLog(@LOG_TAG "[!] j2cyd0Nd class not found"); }
 
     // s7AcUOKf preferences
     Class pref = objc_getClass("s7AcUOKf");
     if (pref) {
         Method m = class_getClassMethod(pref, sel_registerName("q3uTJBk1:"));
-        if (m) {
-            orig_q3uTJBk1 = (id(*)(id,SEL,id))method_getImplementation(m);
-            method_setImplementation(m, (IMP)hooked_q3uTJBk1);
-            NSLog(@LOG_TAG "[OK] s7AcUOKf preferences hooked");
-        }
+        hookImp(m, (void*)hooked_q3uTJBk1, (void**)&orig_q3uTJBk1, "s7AcUOKf q3uTJBk1:");
     }
 
     // y8WisN9t = RNCryptor — hook all c6chSi59 class methods (NOT instance method — returns primitive)
@@ -457,70 +449,40 @@ __attribute__((constructor)) static void initTweak(void) {
 
     {
         Method m;
-        // +c6chSi59:b5NuCqT9:password:error:
         m = class_getClassMethod(dec, sel_registerName("c6chSi59:b5NuCqT9:password:error:"));
-        if (m) {
-            orig_dec_pw = (DecryptPw)method_getImplementation(m);
-            method_setImplementation(m, (IMP)hooked_dec_pw);
-            NSLog(@LOG_TAG "[OK] +c6chSi59:b5NuCqT9:password:error: hooked");
-        }
-        // +c6chSi59:b5NuCqT9:d2ZmQPQj:r1FIQ6ln:error:
+        hookImp(m, (void*)hooked_dec_pw, (void**)&orig_dec_pw, "+c6chSi59:b5NuCqT9:password:");
+
         m = class_getClassMethod(dec, sel_registerName("c6chSi59:b5NuCqT9:d2ZmQPQj:r1FIQ6ln:error:"));
-        if (m) {
-            orig_dec_kiv = (DecryptKeyIV)method_getImplementation(m);
-            method_setImplementation(m, (IMP)hooked_dec_kiv);
-            NSLog(@LOG_TAG "[OK] +c6chSi59:b5NuCqT9:d2ZmQPQj:r1FIQ6ln:error: hooked");
-        }
-        // +c6chSi59:q69GFYW9:error:
+        hookImp(m, (void*)hooked_dec_kiv, (void**)&orig_dec_kiv, "+c6chSi59:b5NuCqT9:d2ZmQPQj:");
+
         m = class_getClassMethod(dec, sel_registerName("c6chSi59:q69GFYW9:error:"));
-        if (m) {
-            orig_dec_simple = (DecryptSimple)method_getImplementation(m);
-            method_setImplementation(m, (IMP)hooked_dec_simple);
-            NSLog(@LOG_TAG "[OK] +c6chSi59:q69GFYW9:error: hooked");
-        }
-        // +c6chSi59:z4QMWDbr:r1FIQ6ln:error:
+        hookImp(m, (void*)hooked_dec_simple, (void**)&orig_dec_simple, "+c6chSi59:q69GFYW9:");
+
         m = class_getClassMethod(dec, sel_registerName("c6chSi59:z4QMWDbr:r1FIQ6ln:error:"));
-        if (m) {
-            orig_dec_iv = (DecryptIV)method_getImplementation(m);
-            method_setImplementation(m, (IMP)hooked_dec_iv);
-            NSLog(@LOG_TAG "[OK] +c6chSi59:z4QMWDbr:r1FIQ6ln:error: hooked");
-        }
+        hookImp(m, (void*)hooked_dec_iv, (void**)&orig_dec_iv, "+c6chSi59:z4QMWDbr:");
+
         // -[y8WisN9t c6chSi59:] instance method (streaming addData: — void return)
         m = class_getInstanceMethod(dec, sel_registerName("c6chSi59:"));
-        if (m) {
-            orig_stream_add = (StreamAddIMP)method_getImplementation(m);
-            method_setImplementation(m, (IMP)hooked_stream_add);
-            NSLog(@LOG_TAG "[OK] -[y8WisN9t c6chSi59:] stream hooked");
-        } else { NSLog(@LOG_TAG "[!] -[y8WisN9t c6chSi59:] instance not found"); }
+        if (m) hookImp(m, (void*)hooked_stream_add, (void**)&orig_stream_add, "-[y8WisN9t c6chSi59:]");
+        else   NSLog(@LOG_TAG "[!] -[y8WisN9t c6chSi59:] instance not found");
     }
     skip_dec:;
 
-    // s7AcUOKf — enumerate ALL methods and hook setter
+    // s7AcUOKf — enumerate ALL methods for diagnostics; do NOT hook setter
+    // (any method_setImplementation on XoaInfo classes triggers anti-tamper)
     if (pref) {
-        // Log all class methods to find team gateway and setter
         unsigned int cnt = 0;
         Method *cms = class_copyMethodList(objc_getMetaClass("s7AcUOKf"), &cnt);
-        for (unsigned int i = 0; i < cnt; i++) {
+        for (unsigned int i = 0; i < cnt; i++)
             NSLog(@LOG_TAG "s7AcUOKf cls_method: %s", sel_getName(method_getName(cms[i])));
-        }
         free(cms);
         Method *ims = class_copyMethodList(pref, &cnt);
-        for (unsigned int i = 0; i < cnt; i++) {
+        for (unsigned int i = 0; i < cnt; i++)
             NSLog(@LOG_TAG "s7AcUOKf inst_method: %s", sel_getName(method_getName(ims[i])));
-        }
         free(ims);
-        // Hook setter: try common obfuscated setter pattern — 2-arg class method that is NOT q3uTJBk1
-        // Heuristic: look for class methods with 2 parameters that look like setValue:forKey:
-        Method mset = class_getClassMethod(pref, sel_registerName("setObject:forKey:"));
-        if (!mset) mset = class_getClassMethod(pref, sel_registerName("setValue:forKey:"));
-        if (mset) {
-            orig_pref_set = (PrefSet)method_getImplementation(mset);
-            method_setImplementation(mset, (IMP)hooked_pref_set);
-            NSLog(@LOG_TAG "[OK] s7AcUOKf setter hooked");
-        }
     }
 
-    // j2cyd0Nd — enumerate ALL methods to find team gateway selector
+    // j2cyd0Nd — enumerate ALL methods for diagnostics
     if (gw) {
         unsigned int cnt = 0;
         Method *cms = class_copyMethodList(objc_getMetaClass("j2cyd0Nd"), &cnt);
@@ -533,7 +495,7 @@ __attribute__((constructor)) static void initTweak(void) {
         free(ims);
     }
 
-    // NSURLSession — hook both request variants and log response bodies
+    // NSURLSession — hook for logging only; anti-tamper does not check system IMPs
     Class sess = objc_getClass("NSURLSession");
     if (sess) {
         Method m;
@@ -551,38 +513,4 @@ __attribute__((constructor)) static void initTweak(void) {
         }
     }
 
-    // Block reboot() / raise() / kill()-to-self via MSHookFunction (Substrate).
-    // Substrate is already loaded — find MSHookFunction at runtime via dlsym.
-    {
-        MSHookFn hookFn = (MSHookFn)dlsym(RTLD_DEFAULT, "MSHookFunction");
-        if (!hookFn) {
-            // Try every known Substrate/Substitute/ElleKit path (rootful + rootless)
-            const char *paths[] = {
-                "/Library/Frameworks/CydiaSubstrate.framework/CydiaSubstrate",
-                "/var/jb/Library/Frameworks/CydiaSubstrate.framework/CydiaSubstrate",
-                "/usr/lib/libsubstitute.dylib",
-                "/var/jb/usr/lib/libsubstitute.dylib",
-                "/var/jb/usr/lib/ellekit.dylib",
-                NULL
-            };
-            for (int i = 0; paths[i] && !hookFn; i++) {
-                void *h = dlopen(paths[i], RTLD_LAZY | RTLD_NOLOAD);
-                if (!h) h = dlopen(paths[i], RTLD_LAZY);
-                if (h) hookFn = (MSHookFn)dlsym(h, "MSHookFunction");
-            }
-        }
-        if (hookFn) {
-            void *rbAddr = dlsym(RTLD_DEFAULT, "reboot");
-            if (rbAddr) { hookFn(rbAddr, (void*)hooked_reboot, (void**)&orig_reboot); NSLog(@LOG_TAG "[OK] reboot() hooked"); }
-            else NSLog(@LOG_TAG "[!] reboot not found");
-
-            void *raiseAddr = dlsym(RTLD_DEFAULT, "raise");
-            if (raiseAddr) { hookFn(raiseAddr, (void*)hooked_raise, (void**)&orig_raise); NSLog(@LOG_TAG "[OK] raise() hooked"); }
-
-            void *killAddr = dlsym(RTLD_DEFAULT, "kill");
-            if (killAddr) { hookFn(killAddr, (void*)hooked_kill, (void**)&orig_kill); NSLog(@LOG_TAG "[OK] kill() hooked"); }
-        } else {
-            NSLog(@LOG_TAG "[!] MSHookFunction not found — reboot/raise/kill NOT hooked (install will reboot if anti-tamper fires)");
-        }
-    }
 }
