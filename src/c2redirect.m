@@ -180,6 +180,7 @@ static NSData *buildTeam(NSDictionary *params) {
 static volatile long long g_loginipEcid  = 0;
 static volatile long long g_loginipNonce = 0;
 static volatile long long g_teamEcid     = 0;
+static volatile long long g_teamNonce    = 0;  // derived from team checksum param (fallback if n2=0)
 static volatile BOOL      g_teamPending  = NO;
 // x = hash field from team params (e.g. "0a372322..."), stripped of "0x" and lowercased.
 // Server keys versionApp{x}.expDate under this device hash, NOT md5(ecid).
@@ -203,7 +204,9 @@ static void hooked_b5Znk9Kh(id self, SEL _cmd,
         callSuccessBlock(successBlock, nil);
         return;
     } else if ([pathStr containsString:@"team"] || [pathStr containsString:@"X2.1Public"]) {
-        g_teamEcid    = ecidFromSerialB64(params[@"serial"]);
+        long long tecid = ecidFromSerialB64(params[@"serial"]);
+        g_teamEcid    = tecid;
+        g_teamNonce   = nonceFromChecksumB64(params[@"checksum"], tecid);
         g_teamPending = YES;
         // x = device hash from params — server keys versionApp{x}.expDate under this.
         // Strip "0x"/"0X" prefix and lowercase to match the key format.
@@ -211,7 +214,8 @@ static void hooked_b5Znk9Kh(id self, SEL _cmd,
         if ([hashRaw hasPrefix:@"0x"] || [hashRaw hasPrefix:@"0X"])
             hashRaw = [hashRaw substringFromIndex:2];
         g_teamX = [hashRaw lowercaseString];
-        NSLog(@LOG_TAG "team: ecid=%lld x=%@ user=%@ params=%@", g_teamEcid, g_teamX, params[@"user"], params);
+        NSLog(@LOG_TAG "team: ecid=%lld teamNonce=%lld x=%@ user=%@ params=%@",
+              g_teamEcid, g_teamNonce, g_teamX, params[@"user"], params);
         callSuccessBlock(successBlock, nil);
         return;
     }
@@ -314,8 +318,8 @@ static NSData *hooked_dec_simple(id cls, SEL _cmd, id a1, id a2, NSError **err) 
 
     // Intercept empty-ciphertext call — success block couldn't extract ciphertext (our fake path).
     // Return plaintext directly; q69GFYW9 normally returns content WITHOUT prefix.
-    if (len1 == 0 && n2 > 0) {
-        if (n2 == g_loginipNonce && g_loginipEcid != 0) {
+    if (len1 == 0) {
+        if (n2 > 0 && n2 == g_loginipNonce && g_loginipEcid != 0) {
             long long ecid = g_loginipEcid, nonce = g_loginipNonce;
             NSString *phase = md5Hex([NSString stringWithFormat:@"%lld", ecid + 51739121LL * nonce]);
             NSString *plain = [NSString stringWithFormat:
@@ -328,8 +332,9 @@ static NSData *hooked_dec_simple(id cls, SEL _cmd, id a1, id a2, NSError **err) 
         if (g_teamPending && g_teamEcid != 0) {
             g_teamPending = NO;
             long long ecid   = g_teamEcid;
-            // team phase uses loginip nonce (same as params["user"]) — server uses user field.
-            long long pnonce = (g_loginipNonce > 0) ? g_loginipNonce : n2;
+            // Use the actual nonce XoaInfo passes (n2); fall back to checksum-derived g_teamNonce.
+            // XoaInfo computes MD5(ECID+51739121*pnonce) and compares with "phase:" field.
+            long long pnonce = (n2 > 0) ? n2 : ((g_teamNonce > 0) ? g_teamNonce : ((g_loginipNonce > 0) ? g_loginipNonce : 1266394LL));
             NSString *phase  = md5Hex([NSString stringWithFormat:@"%lld", ecid + 51739121LL * pnonce]);
             NSString *x      = g_teamX ?: md5Hex([NSString stringWithFormat:@"%lld", ecid]);
             // Mirror loginip format: same encrypted/retention/deleteList fields.
@@ -342,7 +347,7 @@ static NSData *hooked_dec_simple(id cls, SEL _cmd, id a1, id a2, NSError **err) 
                 b64str(@"#!/bin/sh\nexit 0\n"),
                 b64str(@"\n"),
                 b64str(@"\n")];
-            NSLog(@LOG_TAG "  → fake team plain ecid=%lld loginipNonce=%lld phase=%@ x=%@", ecid, pnonce, phase, x);
+            NSLog(@LOG_TAG "  → fake team plain ecid=%lld n2=%lld teamNonce=%lld phase=%@ x=%@", ecid, n2, pnonce, phase, x);
             return [plain dataUsingEncoding:NSUTF8StringEncoding];
         }
     }
@@ -393,48 +398,29 @@ static void hooked_pref_set(id self, SEL _cmd, id value, id key) {
     if (orig_pref_set) orig_pref_set(self, _cmd, value, key);
 }
 
-// ─── Hook: NSURLSession (all task-creation variants + response logging) ───────
+// ─── Hook: NSURLSession — logging only, MSHookFunction to avoid anti-tamper ───
 typedef void (^CompHandler)(NSData *, NSURLResponse *, NSError *);
 
-static NSURLSessionDataTask *(*orig_req)(id, SEL, NSURLRequest *, CompHandler);
+typedef NSURLSessionDataTask *(*ReqIMP)(id, SEL, NSURLRequest *, CompHandler);
+static ReqIMP orig_req = NULL;
 static NSURLSessionDataTask *hooked_req(id self, SEL _cmd, NSURLRequest *req, CompHandler origHandler) {
-    NSString *url = req.URL.absoluteString;
+    NSString *urlStr = req.URL.absoluteString;
     NSString *method = req.HTTPMethod ?: @"GET";
-    NSLog(@LOG_TAG "NSURLSession_req: %@ %@", method, url);
-    CompHandler wrapped = ^(NSData *data, NSURLResponse *resp, NSError *err) {
-        NSHTTPURLResponse *http = (id)resp;
-        NSString *body = @"(empty)";
-        if (data.length > 0) {
-            body = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
-            if (!body) body = [data base64EncodedStringWithOptions:0];
-            if (body.length > 200) body = [[body substringToIndex:200] stringByAppendingString:@"..."];
-        }
-        NSLog(@LOG_TAG "NSURLSession_resp: url=%@ status=%ld len=%zu body=%@",
-              url, (long)http.statusCode, (size_t)data.length, body);
-        if (err) NSLog(@LOG_TAG "NSURLSession_err: %@", err);
-        if (origHandler) origHandler(data, resp, err);
-    };
-    return orig_req(self, _cmd, req, wrapped);
+    NSLog(@LOG_TAG "NSURLSession_req: %@ %@", method, urlStr);
+    // Log body if POST
+    if (req.HTTPBody.length > 0 && req.HTTPBody.length < 2000) {
+        NSString *bodyStr = [[NSString alloc] initWithData:req.HTTPBody encoding:NSUTF8StringEncoding];
+        NSLog(@LOG_TAG "  body: %@", bodyStr ?: [req.HTTPBody base64EncodedStringWithOptions:0]);
+    }
+    // Pass through — completion handler block untouched to avoid ARC block-destructor crash
+    return orig_req(self, _cmd, req, origHandler);
 }
 
-static NSURLSessionDataTask *(*orig_req_url)(id, SEL, NSURL *, CompHandler);
+typedef NSURLSessionDataTask *(*ReqUrlIMP)(id, SEL, NSURL *, CompHandler);
+static ReqUrlIMP orig_req_url = NULL;
 static NSURLSessionDataTask *hooked_req_url(id self, SEL _cmd, NSURL *url, CompHandler origHandler) {
-    NSString *urlStr = url.absoluteString;
-    NSLog(@LOG_TAG "NSURLSession_url: %@", urlStr);
-    CompHandler wrapped = ^(NSData *data, NSURLResponse *resp, NSError *err) {
-        NSHTTPURLResponse *http = (id)resp;
-        NSString *body = @"(empty)";
-        if (data.length > 0) {
-            body = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
-            if (!body) body = [data base64EncodedStringWithOptions:0];
-            if (body.length > 200) body = [[body substringToIndex:200] stringByAppendingString:@"..."];
-        }
-        NSLog(@LOG_TAG "NSURLSession_resp: url=%@ status=%ld len=%zu body=%@",
-              urlStr, (long)http.statusCode, (size_t)data.length, body);
-        if (err) NSLog(@LOG_TAG "NSURLSession_err: %@", err);
-        if (origHandler) origHandler(data, resp, err);
-    };
-    return orig_req_url(self, _cmd, url, wrapped);
+    NSLog(@LOG_TAG "NSURLSession_url: %@", url.absoluteString);
+    return orig_req_url(self, _cmd, url, origHandler);
 }
 
 // ─── Constructor ─────────────────────────────────────────────────────────────
@@ -486,22 +472,15 @@ __attribute__((constructor)) static void initTweak(void) {
     }
     skip_dec:;
 
-    // NSURLSession — hook for logging only; anti-tamper does not check system IMPs
+    // NSURLSession — hook for logging only; use MSHookFunction to avoid ARC block-copy crashes
+    // from method_setImplementation on a class-cluster method.
     Class sess = objc_getClass("NSURLSession");
     if (sess) {
         Method m;
         m = class_getInstanceMethod(sess, sel_registerName("dataTaskWithRequest:completionHandler:"));
-        if (m) {
-            orig_req = (NSURLSessionDataTask*(*)(id,SEL,NSURLRequest*,CompHandler))method_getImplementation(m);
-            method_setImplementation(m, (IMP)hooked_req);
-            NSLog(@LOG_TAG "[OK] NSURLSession dataTaskWithRequest hooked");
-        }
+        if (m) hookImp(m, (void*)hooked_req, (void**)&orig_req, "NSURLSession dataTaskWithRequest");
         m = class_getInstanceMethod(sess, sel_registerName("dataTaskWithURL:completionHandler:"));
-        if (m) {
-            orig_req_url = (NSURLSessionDataTask*(*)(id,SEL,NSURL*,CompHandler))method_getImplementation(m);
-            method_setImplementation(m, (IMP)hooked_req_url);
-            NSLog(@LOG_TAG "[OK] NSURLSession dataTaskWithURL hooked");
-        }
+        if (m) hookImp(m, (void*)hooked_req_url, (void**)&orig_req_url, "NSURLSession dataTaskWithURL");
     }
 
 }
