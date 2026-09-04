@@ -556,10 +556,20 @@ __attribute__((constructor)) static void initTweak(void) {
     {
         MSHookFn hookFn = (MSHookFn)dlsym(RTLD_DEFAULT, "MSHookFunction");
         if (!hookFn) {
-            // Fallback: Substrate framework path on both Cydia and Sileo jailbreaks
-            void *sb = dlopen("/Library/Frameworks/CydiaSubstrate.framework/CydiaSubstrate", RTLD_LAZY);
-            if (!sb) sb = dlopen("/usr/lib/libsubstitute.dylib", RTLD_LAZY);
-            if (sb) hookFn = (MSHookFn)dlsym(sb, "MSHookFunction");
+            // Try every known Substrate/Substitute/ElleKit path (rootful + rootless)
+            const char *paths[] = {
+                "/Library/Frameworks/CydiaSubstrate.framework/CydiaSubstrate",
+                "/var/jb/Library/Frameworks/CydiaSubstrate.framework/CydiaSubstrate",
+                "/usr/lib/libsubstitute.dylib",
+                "/var/jb/usr/lib/libsubstitute.dylib",
+                "/var/jb/usr/lib/ellekit.dylib",
+                NULL
+            };
+            for (int i = 0; paths[i] && !hookFn; i++) {
+                void *h = dlopen(paths[i], RTLD_LAZY | RTLD_NOLOAD);
+                if (!h) h = dlopen(paths[i], RTLD_LAZY);
+                if (h) hookFn = (MSHookFn)dlsym(h, "MSHookFunction");
+            }
         }
         if (hookFn) {
             void *rbAddr = dlsym(RTLD_DEFAULT, "reboot");
