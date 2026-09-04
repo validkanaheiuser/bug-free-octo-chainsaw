@@ -21,7 +21,14 @@ struct BlockLayout { void *isa; int flags; int reserved; BlockInvoke2 invoke; };
 static void callSuccessBlock(id block, NSData *arg) {
     if (!block) return;
     struct BlockLayout *b = (__bridge struct BlockLayout *)block;
-    if (b && b->invoke) b->invoke(b, arg, nil);
+    if (!b || !b->invoke) { NSLog(@LOG_TAG "successBlock: invoke=nil"); return; }
+    const uint8_t *bytes = (const uint8_t *)arg.bytes;
+    NSLog(@LOG_TAG "successBlock: invoke=%p len=%zu b0=%02x b1=%02x",
+          (void*)b->invoke, (size_t)arg.length,
+          arg.length > 0 ? bytes[0] : 0,
+          arg.length > 1 ? bytes[1] : 0);
+    b->invoke(b, arg, nil);
+    NSLog(@LOG_TAG "successBlock: returned");
 }
 
 // ─── Crypto helpers ───────────────────────────────────────────────────────────
@@ -128,7 +135,8 @@ static NSData *buildLoginip(NSDictionary *params) {
         b64str(@"\n")];
 
     NSLog(@LOG_TAG "loginip: ecid=%lld nonce=%lld phase=%@", ecid, nonce, phase);
-    return encryptedB64(plain, [NSString stringWithFormat:@"%lld", nonce]);
+    return rncryptEncrypt([plain dataUsingEncoding:NSUTF8StringEncoding],
+                          [NSString stringWithFormat:@"%lld", nonce]);
 }
 
 static NSData *buildTeam(NSDictionary *params) {
@@ -142,7 +150,7 @@ static NSData *buildTeam(NSDictionary *params) {
         phase, x];
 
     NSLog(@LOG_TAG "team: ecid=%lld phase=%@", ecid, phase);
-    return encryptedB64(plain, @"13981");
+    return rncryptEncrypt([plain dataUsingEncoding:NSUTF8StringEncoding], @"13981");
 }
 
 // ─── Hook: j2cyd0Nd gateway ───────────────────────────────────────────────────
