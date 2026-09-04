@@ -468,33 +468,6 @@ __attribute__((constructor)) static void initTweak(void) {
     }
     skip_dec:;
 
-    // s7AcUOKf — enumerate ALL methods for diagnostics; do NOT hook setter
-    // (any method_setImplementation on XoaInfo classes triggers anti-tamper)
-    if (pref) {
-        unsigned int cnt = 0;
-        Method *cms = class_copyMethodList(objc_getMetaClass("s7AcUOKf"), &cnt);
-        for (unsigned int i = 0; i < cnt; i++)
-            NSLog(@LOG_TAG "s7AcUOKf cls_method: %s", sel_getName(method_getName(cms[i])));
-        free(cms);
-        Method *ims = class_copyMethodList(pref, &cnt);
-        for (unsigned int i = 0; i < cnt; i++)
-            NSLog(@LOG_TAG "s7AcUOKf inst_method: %s", sel_getName(method_getName(ims[i])));
-        free(ims);
-    }
-
-    // j2cyd0Nd — enumerate ALL methods for diagnostics
-    if (gw) {
-        unsigned int cnt = 0;
-        Method *cms = class_copyMethodList(objc_getMetaClass("j2cyd0Nd"), &cnt);
-        for (unsigned int i = 0; i < cnt; i++)
-            NSLog(@LOG_TAG "j2cyd0Nd cls_method: %s", sel_getName(method_getName(cms[i])));
-        free(cms);
-        Method *ims = class_copyMethodList(gw, &cnt);
-        for (unsigned int i = 0; i < cnt; i++)
-            NSLog(@LOG_TAG "j2cyd0Nd inst_method: %s", sel_getName(method_getName(ims[i])));
-        free(ims);
-    }
-
     // NSURLSession — hook for logging only; anti-tamper does not check system IMPs
     Class sess = objc_getClass("NSURLSession");
     if (sess) {
