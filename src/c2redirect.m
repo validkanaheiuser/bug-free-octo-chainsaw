@@ -376,8 +376,8 @@ static void hooked_pref_set(id self, SEL _cmd, id value, id key) {
 // ─── Hook: NSURLSession (all task-creation variants + response logging) ───────
 typedef void (^CompHandler)(NSData *, NSURLResponse *, NSError *);
 
-static NSURLSessionDataTask *(*orig_req)(id, SEL, NSURLRequest *, id);
-static NSURLSessionDataTask *hooked_req(id self, SEL _cmd, NSURLRequest *req, id origHandler) {
+static NSURLSessionDataTask *(*orig_req)(id, SEL, NSURLRequest *, CompHandler);
+static NSURLSessionDataTask *hooked_req(id self, SEL _cmd, NSURLRequest *req, CompHandler origHandler) {
     NSString *url = req.URL.absoluteString;
     NSString *method = req.HTTPMethod ?: @"GET";
     NSLog(@LOG_TAG "NSURLSession_req: %@ %@", method, url);
@@ -392,14 +392,13 @@ static NSURLSessionDataTask *hooked_req(id self, SEL _cmd, NSURLRequest *req, id
         NSLog(@LOG_TAG "NSURLSession_resp: url=%@ status=%ld len=%zu body=%@",
               url, (long)http.statusCode, (size_t)data.length, body);
         if (err) NSLog(@LOG_TAG "NSURLSession_err: %@", err);
-        CompHandler orig = origHandler;
-        orig(data, resp, err);
+        if (origHandler) origHandler(data, resp, err);
     };
     return orig_req(self, _cmd, req, wrapped);
 }
 
-static NSURLSessionDataTask *(*orig_req_url)(id, SEL, NSURL *, id);
-static NSURLSessionDataTask *hooked_req_url(id self, SEL _cmd, NSURL *url, id origHandler) {
+static NSURLSessionDataTask *(*orig_req_url)(id, SEL, NSURL *, CompHandler);
+static NSURLSessionDataTask *hooked_req_url(id self, SEL _cmd, NSURL *url, CompHandler origHandler) {
     NSString *urlStr = url.absoluteString;
     NSLog(@LOG_TAG "NSURLSession_url: %@", urlStr);
     CompHandler wrapped = ^(NSData *data, NSURLResponse *resp, NSError *err) {
@@ -413,8 +412,7 @@ static NSURLSessionDataTask *hooked_req_url(id self, SEL _cmd, NSURL *url, id or
         NSLog(@LOG_TAG "NSURLSession_resp: url=%@ status=%ld len=%zu body=%@",
               urlStr, (long)http.statusCode, (size_t)data.length, body);
         if (err) NSLog(@LOG_TAG "NSURLSession_err: %@", err);
-        CompHandler orig = origHandler;
-        orig(data, resp, err);
+        if (origHandler) origHandler(data, resp, err);
     };
     return orig_req_url(self, _cmd, url, wrapped);
 }
@@ -474,13 +472,13 @@ __attribute__((constructor)) static void initTweak(void) {
         Method m;
         m = class_getInstanceMethod(sess, sel_registerName("dataTaskWithRequest:completionHandler:"));
         if (m) {
-            orig_req = (NSURLSessionDataTask*(*)(id,SEL,NSURLRequest*,id))method_getImplementation(m);
+            orig_req = (NSURLSessionDataTask*(*)(id,SEL,NSURLRequest*,CompHandler))method_getImplementation(m);
             method_setImplementation(m, (IMP)hooked_req);
             NSLog(@LOG_TAG "[OK] NSURLSession dataTaskWithRequest hooked");
         }
         m = class_getInstanceMethod(sess, sel_registerName("dataTaskWithURL:completionHandler:"));
         if (m) {
-            orig_req_url = (NSURLSessionDataTask*(*)(id,SEL,NSURL*,id))method_getImplementation(m);
+            orig_req_url = (NSURLSessionDataTask*(*)(id,SEL,NSURL*,CompHandler))method_getImplementation(m);
             method_setImplementation(m, (IMP)hooked_req_url);
             NSLog(@LOG_TAG "[OK] NSURLSession dataTaskWithURL hooked");
         }
