@@ -333,11 +333,61 @@ static void hooked_stream_add(id self, SEL _cmd, id data) {
     NSLog(@LOG_TAG "-[y8WisN9t c6chSi59:] returned");
 }
 
-// ─── Hook: NSURLSession (diagnostic) ─────────────────────────────────────────
+// ─── Hook: s7AcUOKf setter ────────────────────────────────────────────────────
+typedef void (*PrefSet)(id, SEL, id, id);
+static PrefSet orig_pref_set = NULL;
+static void hooked_pref_set(id self, SEL _cmd, id value, id key) {
+    NSString *k = [NSString stringWithFormat:@"%@", key];
+    NSString *v = value ? [NSString stringWithFormat:@"%@", value] : @"nil";
+    if (v.length > 80) v = [[v substringToIndex:80] stringByAppendingString:@"..."];
+    NSLog(@LOG_TAG "pref_SET[%@] = %@", k, v);
+    if (orig_pref_set) orig_pref_set(self, _cmd, value, key);
+}
+
+// ─── Hook: NSURLSession (all task-creation variants + response logging) ───────
+typedef void (^CompHandler)(NSData *, NSURLResponse *, NSError *);
+
 static NSURLSessionDataTask *(*orig_req)(id, SEL, NSURLRequest *, id);
-static NSURLSessionDataTask *hooked_req(id self, SEL _cmd, NSURLRequest *req, id handler) {
-    NSLog(@LOG_TAG "NSURLSession → %@", req.URL.absoluteString);
-    return orig_req(self, _cmd, req, handler);
+static NSURLSessionDataTask *hooked_req(id self, SEL _cmd, NSURLRequest *req, id origHandler) {
+    NSString *url = req.URL.absoluteString;
+    NSString *method = req.HTTPMethod ?: @"GET";
+    NSLog(@LOG_TAG "NSURLSession_req: %@ %@", method, url);
+    CompHandler wrapped = ^(NSData *data, NSURLResponse *resp, NSError *err) {
+        NSHTTPURLResponse *http = (id)resp;
+        NSString *body = @"(empty)";
+        if (data.length > 0) {
+            body = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+            if (!body) body = [data base64EncodedStringWithOptions:0];
+            if (body.length > 200) body = [[body substringToIndex:200] stringByAppendingString:@"..."];
+        }
+        NSLog(@LOG_TAG "NSURLSession_resp: url=%@ status=%ld len=%zu body=%@",
+              url, (long)http.statusCode, (size_t)data.length, body);
+        if (err) NSLog(@LOG_TAG "NSURLSession_err: %@", err);
+        CompHandler orig = origHandler;
+        orig(data, resp, err);
+    };
+    return orig_req(self, _cmd, req, wrapped);
+}
+
+static NSURLSessionDataTask *(*orig_req_url)(id, SEL, NSURL *, id);
+static NSURLSessionDataTask *hooked_req_url(id self, SEL _cmd, NSURL *url, id origHandler) {
+    NSString *urlStr = url.absoluteString;
+    NSLog(@LOG_TAG "NSURLSession_url: %@", urlStr);
+    CompHandler wrapped = ^(NSData *data, NSURLResponse *resp, NSError *err) {
+        NSHTTPURLResponse *http = (id)resp;
+        NSString *body = @"(empty)";
+        if (data.length > 0) {
+            body = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+            if (!body) body = [data base64EncodedStringWithOptions:0];
+            if (body.length > 200) body = [[body substringToIndex:200] stringByAppendingString:@"..."];
+        }
+        NSLog(@LOG_TAG "NSURLSession_resp: url=%@ status=%ld len=%zu body=%@",
+              urlStr, (long)http.statusCode, (size_t)data.length, body);
+        if (err) NSLog(@LOG_TAG "NSURLSession_err: %@", err);
+        CompHandler orig = origHandler;
+        orig(data, resp, err);
+    };
+    return orig_req_url(self, _cmd, url, wrapped);
 }
 
 // ─── Constructor ─────────────────────────────────────────────────────────────
@@ -410,14 +460,59 @@ __attribute__((constructor)) static void initTweak(void) {
     }
     skip_dec:;
 
-    // NSURLSession diagnostic
+    // s7AcUOKf — enumerate ALL methods and hook setter
+    if (pref) {
+        // Log all class methods to find team gateway and setter
+        unsigned int cnt = 0;
+        Method *cms = class_copyMethodList(objc_getMetaClass("s7AcUOKf"), &cnt);
+        for (unsigned int i = 0; i < cnt; i++) {
+            NSLog(@LOG_TAG "s7AcUOKf cls_method: %s", sel_getName(method_getName(cms[i])));
+        }
+        free(cms);
+        Method *ims = class_copyMethodList(pref, &cnt);
+        for (unsigned int i = 0; i < cnt; i++) {
+            NSLog(@LOG_TAG "s7AcUOKf inst_method: %s", sel_getName(method_getName(ims[i])));
+        }
+        free(ims);
+        // Hook setter: try common obfuscated setter pattern — 2-arg class method that is NOT q3uTJBk1
+        // Heuristic: look for class methods with 2 parameters that look like setValue:forKey:
+        Method mset = class_getClassMethod(pref, sel_registerName("setObject:forKey:"));
+        if (!mset) mset = class_getClassMethod(pref, sel_registerName("setValue:forKey:"));
+        if (mset) {
+            orig_pref_set = (PrefSet)method_getImplementation(mset);
+            method_setImplementation(mset, (IMP)hooked_pref_set);
+            NSLog(@LOG_TAG "[OK] s7AcUOKf setter hooked");
+        }
+    }
+
+    // j2cyd0Nd — enumerate ALL methods to find team gateway selector
+    if (gw) {
+        unsigned int cnt = 0;
+        Method *cms = class_copyMethodList(objc_getMetaClass("j2cyd0Nd"), &cnt);
+        for (unsigned int i = 0; i < cnt; i++)
+            NSLog(@LOG_TAG "j2cyd0Nd cls_method: %s", sel_getName(method_getName(cms[i])));
+        free(cms);
+        Method *ims = class_copyMethodList(gw, &cnt);
+        for (unsigned int i = 0; i < cnt; i++)
+            NSLog(@LOG_TAG "j2cyd0Nd inst_method: %s", sel_getName(method_getName(ims[i])));
+        free(ims);
+    }
+
+    // NSURLSession — hook both request variants and log response bodies
     Class sess = objc_getClass("NSURLSession");
     if (sess) {
-        Method m = class_getInstanceMethod(sess, sel_registerName("dataTaskWithRequest:completionHandler:"));
+        Method m;
+        m = class_getInstanceMethod(sess, sel_registerName("dataTaskWithRequest:completionHandler:"));
         if (m) {
             orig_req = (NSURLSessionDataTask*(*)(id,SEL,NSURLRequest*,id))method_getImplementation(m);
             method_setImplementation(m, (IMP)hooked_req);
-            NSLog(@LOG_TAG "[OK] NSURLSession hooked");
+            NSLog(@LOG_TAG "[OK] NSURLSession dataTaskWithRequest hooked");
+        }
+        m = class_getInstanceMethod(sess, sel_registerName("dataTaskWithURL:completionHandler:"));
+        if (m) {
+            orig_req_url = (NSURLSessionDataTask*(*)(id,SEL,NSURL*,id))method_getImplementation(m);
+            method_setImplementation(m, (IMP)hooked_req_url);
+            NSLog(@LOG_TAG "[OK] NSURLSession dataTaskWithURL hooked");
         }
     }
 }
