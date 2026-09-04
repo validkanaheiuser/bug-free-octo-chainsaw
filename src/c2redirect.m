@@ -25,18 +25,18 @@ static void callSuccessBlock(id block, NSData *arg) {
           arg.length > 1 ? bytes[1] : 0,
           NSStringFromClass([arg class]));
 
-    // Log full b64 in 400-char chunks so log is not truncated
+    // Full base64 in 400-char chunks
     NSString *b64 = [arg base64EncodedStringWithOptions:0];
     NSUInteger total = b64.length, chunk = 400;
     for (NSUInteger i = 0; i < total; i += chunk) {
         NSUInteger end = MIN(i + chunk, total);
-        NSLog(@LOG_TAG "  blob_b64[%lu-%lu]: %@",
-              (unsigned long)i, (unsigned long)(end - 1),
-              [b64 substringWithRange:NSMakeRange(i, end - i)]);
+        NSLog(@LOG_TAG "  blob[%lu-%lu]: %@",
+              (unsigned long)i, (unsigned long)(end-1),
+              [b64 substringWithRange:NSMakeRange(i, end-i)]);
     }
 
     b->invoke(b, arg, nil);
-    NSLog(@LOG_TAG "successBlock: returned normally");
+    NSLog(@LOG_TAG "successBlock: returned");
 }
 
 // ─── Crypto helpers ───────────────────────────────────────────────────────────
@@ -52,7 +52,7 @@ static NSString *md5Hex(NSString *s) {
 // blob = 03 01 | encSalt(8) | hmacSalt(8) | ivHeader(16) | CT | zeros(64)
 // encKey   = PBKDF2(pw, encSalt||hmacSalt, SHA512, 10000, 32)
 // actualIV = PBKDF2(pw, ivHeader,          SHA512, 10000, 16)
-// plaintext: prepend 16 random bytes — XoaInfo parser skips first 16B of decrypted output
+// plaintext: 16 random prefix bytes — XoaInfo parser skips first 16B after decryption
 static NSData *rncryptEncrypt(NSData *plain, NSString *password) {
     const char *pw = [password UTF8String];
     size_t pwLen   = strlen(pw);
@@ -77,11 +77,10 @@ static NSData *rncryptEncrypt(NSData *plain, NSString *password) {
     size_t ctBufLen = prefixed.length + kCCBlockSizeAES128;
     void *ctBuf = malloc(ctBufLen);
     size_t ctLen = 0;
-    CCStatus st = CCCrypt(kCCEncrypt, kCCAlgorithmAES, kCCOptionPKCS7Padding,
+    CCCrypt(kCCEncrypt, kCCAlgorithmAES, kCCOptionPKCS7Padding,
             encKey, 32, actualIV,
             prefixed.bytes, prefixed.length,
             ctBuf, ctBufLen, &ctLen);
-    NSLog(@LOG_TAG "CCCrypt status=%d ctLen=%zu", (int)st, ctLen);
 
     uint8_t hdr[2] = {0x03, 0x01};
     NSMutableData *blob = [NSMutableData data];
@@ -92,7 +91,6 @@ static NSData *rncryptEncrypt(NSData *plain, NSString *password) {
     [blob appendBytes:ctBuf    length:ctLen]; free(ctBuf);
     uint8_t trailer[64] = {0};
     [blob appendBytes:trailer  length:64];
-    NSLog(@LOG_TAG "rncryptEncrypt: blobLen=%zu pw='%@' plainLen=%zu", blob.length, password, plain.length);
     return blob;
 }
 
@@ -104,31 +102,23 @@ static NSString *b64str(NSString *s) {
 static long long ecidFromSerialB64(NSString *b64) {
     if (!b64) return 1LL;
     NSData *d = [[NSData alloc] initWithBase64EncodedString:b64 options:0];
-    if (!d) { NSLog(@LOG_TAG "ecid: base64 decode failed for serial=%@", b64); return 1LL; }
+    if (!d) return 1LL;
     NSString *decoded = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
-    NSLog(@LOG_TAG "serial decoded: '%@'", decoded);
     NSArray *parts = [decoded componentsSeparatedByString:@"|"];
-    long long ecid = parts.count >= 3 ? [parts[2] longLongValue] : 1LL;
-    NSLog(@LOG_TAG "ecid=%lld (from %lu parts)", ecid, (unsigned long)parts.count);
-    return ecid;
+    return parts.count >= 3 ? [parts[2] longLongValue] : 1LL;
 }
 
 static long long nonceFromChecksumB64(NSString *b64, long long ecid) {
     if (!b64) return 1266394LL;
     NSData *d = [[NSData alloc] initWithBase64EncodedString:b64 options:0];
-    if (!d) { NSLog(@LOG_TAG "nonce: base64 decode failed for checksum=%@", b64); return 1266394LL; }
-    NSString *decoded = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
-    long long val = [decoded longLongValue];
-    NSLog(@LOG_TAG "checksum decoded: '%@' → val=%lld ecid=%lld diff=%lld",
-          decoded, val, ecid, val - ecid);
-    long long nonce = val > ecid ? (val - ecid) / 124457LL : 1266394LL;
-    NSLog(@LOG_TAG "nonce=%lld remainder=%lld", nonce, (val - ecid) % 124457LL);
-    return nonce;
+    if (!d) return 1266394LL;
+    long long val = [[[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding] longLongValue];
+    NSLog(@LOG_TAG "checksum_val=%lld ecid=%lld", val, ecid);
+    return val > ecid ? (val - ecid) / 124457LL : 1266394LL;
 }
 
 // ─── Response builders ────────────────────────────────────────────────────────
 static NSData *buildLoginip(NSDictionary *params) {
-    NSLog(@LOG_TAG "buildLoginip params=%@", params);
     long long ecid  = ecidFromSerialB64(params[@"serial"]);
     long long nonce = nonceFromChecksumB64(params[@"checksum"], ecid);
     NSString *phase = md5Hex([NSString stringWithFormat:@"%lld", ecid + 51739121LL * nonce]);
@@ -142,13 +132,11 @@ static NSData *buildLoginip(NSDictionary *params) {
         b64str(@"\n")];
 
     NSLog(@LOG_TAG "loginip: ecid=%lld nonce=%lld phase=%@", ecid, nonce, phase);
-    NSLog(@LOG_TAG "loginip plain: '%@'", plain);
     return rncryptEncrypt([plain dataUsingEncoding:NSUTF8StringEncoding],
                           [NSString stringWithFormat:@"%lld", nonce]);
 }
 
 static NSData *buildTeam(NSDictionary *params) {
-    NSLog(@LOG_TAG "buildTeam params=%@", params);
     const long long teamV19 = 13981LL;
     long long ecid  = ecidFromSerialB64(params[@"serial"]);
     NSString *phase = md5Hex([NSString stringWithFormat:@"%lld", ecid + 51739121LL * teamV19]);
@@ -159,7 +147,6 @@ static NSData *buildTeam(NSDictionary *params) {
         phase, x];
 
     NSLog(@LOG_TAG "team: ecid=%lld phase=%@", ecid, phase);
-    NSLog(@LOG_TAG "team plain: '%@'", plain);
     return rncryptEncrypt([plain dataUsingEncoding:NSUTF8StringEncoding], @"13981");
 }
 
@@ -169,9 +156,7 @@ static void (*orig_b5Znk9Kh)(id, SEL, id, id, id, id);
 static void hooked_b5Znk9Kh(id self, SEL _cmd,
                               id params, id path, id successBlock, id failureBlock) {
     NSString *pathStr = [NSString stringWithFormat:@"%@", path];
-    NSLog(@LOG_TAG "gateway: path=%@ self=%@ successBlock=%p failureBlock=%p",
-          pathStr, NSStringFromClass([self class]),
-          (__bridge void*)successBlock, (__bridge void*)failureBlock);
+    NSLog(@LOG_TAG "gateway: %@ successBlock=%p", pathStr, (__bridge void*)successBlock);
 
     NSData *resp = nil;
     if ([pathStr containsString:@"loginip"]) {
@@ -201,45 +186,80 @@ static id hooked_q3uTJBk1(id self, SEL _cmd, id key) {
              [k isEqualToString:@"DeleteListData"]) result = b64str(@"\n");
     else { spoofed = NO; result = orig_q3uTJBk1 ? orig_q3uTJBk1(self, _cmd, key) : nil; }
 
-    // Truncate long values in log
-    NSString *displayVal = result ? [NSString stringWithFormat:@"%@", result] : @"nil";
-    if (displayVal.length > 60) displayVal = [[displayVal substringToIndex:60] stringByAppendingString:@"..."];
-    NSLog(@LOG_TAG "pref[%@]%@ → %@", k, spoofed ? @"(spoofed)" : @"", displayVal);
+    NSString *disp = result ? [NSString stringWithFormat:@"%@", result] : @"nil";
+    if (disp.length > 60) disp = [[disp substringToIndex:60] stringByAppendingString:@"..."];
+    NSLog(@LOG_TAG "pref[%@]%@ → %@", k, spoofed ? @"(spoofed)" : @"", disp);
     return result;
 }
 
-// ─── Hook: y8WisN9t decryptor ────────────────────────────────────────────────
-// Hooked at runtime if c6chSi59: found as class or instance method
-typedef id (*DecryptFn)(id, SEL, id);
-static DecryptFn orig_c6chSi59_inst = NULL;
-static DecryptFn orig_c6chSi59_cls  = NULL;
+// ─── Hook: y8WisN9t = RNCryptor decryptor (class methods) ────────────────────
 
-static id hooked_c6chSi59_inst(id self, SEL _cmd, id arg) {
-    NSLog(@LOG_TAG "-[y8WisN9t c6chSi59:] arg class=%@ len=%zu",
-          NSStringFromClass([arg class]),
-          [arg respondsToSelector:@selector(length)] ? [(NSData*)arg length] : 0UL);
-    if ([arg isKindOfClass:[NSData class]])
-        NSLog(@LOG_TAG "  arg_b64=%.120@", [(NSData*)arg base64EncodedStringWithOptions:0]);
-    else if ([arg isKindOfClass:[NSString class]])
-        NSLog(@LOG_TAG "  arg_str=%.120@", (NSString*)arg);
-    id result = orig_c6chSi59_inst(self, _cmd, arg);
-    NSLog(@LOG_TAG "  → result class=%@ value=%.120@",
-          NSStringFromClass([result class]), [result description]);
-    return result;
+// +c6chSi59:b5NuCqT9:password:error:  (cipherData, ?, password, &error)
+typedef NSData *(*DecryptPw)(id, SEL, id, id, NSString *, NSError **);
+static DecryptPw orig_dec_pw = NULL;
+static NSData *hooked_dec_pw(id cls, SEL _cmd, id arg1, id arg2, NSString *pw, NSError **err) {
+    NSLog(@LOG_TAG "+c6chSi59:b5NuCqT9:password: arg1=%@/%zu arg2=%@ pw='%@'",
+          NSStringFromClass([arg1 class]),
+          [arg1 respondsToSelector:@selector(length)] ? [(NSData*)arg1 length] : 0,
+          [arg2 description], pw);
+    if ([arg1 isKindOfClass:[NSData class]])
+        NSLog(@LOG_TAG "  arg1_b64=%.300@", [(NSData*)arg1 base64EncodedStringWithOptions:0]);
+    else if ([arg1 isKindOfClass:[NSString class]])
+        NSLog(@LOG_TAG "  arg1_str=%.300@", (NSString*)arg1);
+    NSData *res = orig_dec_pw(cls, _cmd, arg1, arg2, pw, err);
+    if (err && *err) NSLog(@LOG_TAG "  error=%@", *err);
+    NSLog(@LOG_TAG "  → result len=%zu first=%.40@",
+          res.length, [[NSString alloc] initWithData:[res subdataWithRange:NSMakeRange(0, MIN(40, res.length))] encoding:NSUTF8StringEncoding]);
+    return res;
 }
 
-static id hooked_c6chSi59_cls(id self, SEL _cmd, id arg) {
-    NSLog(@LOG_TAG "+[y8WisN9t c6chSi59:] arg class=%@ len=%zu",
-          NSStringFromClass([arg class]),
-          [arg respondsToSelector:@selector(length)] ? [(NSData*)arg length] : 0UL);
-    if ([arg isKindOfClass:[NSData class]])
-        NSLog(@LOG_TAG "  arg_b64=%.120@", [(NSData*)arg base64EncodedStringWithOptions:0]);
-    else if ([arg isKindOfClass:[NSString class]])
-        NSLog(@LOG_TAG "  arg_str=%.120@", (NSString*)arg);
-    id result = orig_c6chSi59_cls(self, _cmd, arg);
-    NSLog(@LOG_TAG "  → result class=%@ value=%.120@",
-          NSStringFromClass([result class]), [result description]);
-    return result;
+// +c6chSi59:b5NuCqT9:d2ZmQPQj:r1FIQ6ln:error:  (cipherData, ?, key, iv, &error)
+typedef NSData *(*DecryptKeyIV)(id, SEL, id, id, id, id, NSError **);
+static DecryptKeyIV orig_dec_kiv = NULL;
+static NSData *hooked_dec_kiv(id cls, SEL _cmd, id a1, id a2, id a3, id a4, NSError **err) {
+    NSLog(@LOG_TAG "+c6chSi59:b5NuCqT9:d2ZmQPQj:r1FIQ6ln: a1=%@/%zu a2=%@ a3=%zu a4=%zu",
+          NSStringFromClass([a1 class]),
+          [a1 respondsToSelector:@selector(length)] ? [(NSData*)a1 length] : 0,
+          [a2 description],
+          [a3 respondsToSelector:@selector(length)] ? [(NSData*)a3 length] : 0,
+          [a4 respondsToSelector:@selector(length)] ? [(NSData*)a4 length] : 0);
+    if ([a1 isKindOfClass:[NSData class]])
+        NSLog(@LOG_TAG "  a1_b64=%.200@", [(NSData*)a1 base64EncodedStringWithOptions:0]);
+    NSData *res = orig_dec_kiv(cls, _cmd, a1, a2, a3, a4, err);
+    if (err && *err) NSLog(@LOG_TAG "  error=%@", *err);
+    NSLog(@LOG_TAG "  → result len=%zu", res.length);
+    return res;
+}
+
+// +c6chSi59:q69GFYW9:error:  (data, ?, &error)
+typedef NSData *(*DecryptSimple)(id, SEL, id, id, NSError **);
+static DecryptSimple orig_dec_simple = NULL;
+static NSData *hooked_dec_simple(id cls, SEL _cmd, id a1, id a2, NSError **err) {
+    NSLog(@LOG_TAG "+c6chSi59:q69GFYW9: a1=%@/%zu a2=%@",
+          NSStringFromClass([a1 class]),
+          [a1 respondsToSelector:@selector(length)] ? [(NSData*)a1 length] : 0,
+          [a2 description]);
+    if ([a1 isKindOfClass:[NSData class]])
+        NSLog(@LOG_TAG "  a1_b64=%.200@", [(NSData*)a1 base64EncodedStringWithOptions:0]);
+    NSData *res = orig_dec_simple(cls, _cmd, a1, a2, err);
+    if (err && *err) NSLog(@LOG_TAG "  error=%@", *err);
+    NSLog(@LOG_TAG "  → result len=%zu", res.length);
+    return res;
+}
+
+// +c6chSi59:z4QMWDbr:r1FIQ6ln:error:  (data, ?, iv, &error)
+typedef NSData *(*DecryptIV)(id, SEL, id, id, id, NSError **);
+static DecryptIV orig_dec_iv = NULL;
+static NSData *hooked_dec_iv(id cls, SEL _cmd, id a1, id a2, id a3, NSError **err) {
+    NSLog(@LOG_TAG "+c6chSi59:z4QMWDbr:r1FIQ6ln: a1=%@/%zu a2=%@ a3=%zu",
+          NSStringFromClass([a1 class]),
+          [a1 respondsToSelector:@selector(length)] ? [(NSData*)a1 length] : 0,
+          [a2 description],
+          [a3 respondsToSelector:@selector(length)] ? [(NSData*)a3 length] : 0);
+    NSData *res = orig_dec_iv(cls, _cmd, a1, a2, a3, err);
+    if (err && *err) NSLog(@LOG_TAG "  error=%@", *err);
+    NSLog(@LOG_TAG "  → result len=%zu", res.length);
+    return res;
 }
 
 // ─── Hook: NSURLSession (diagnostic) ─────────────────────────────────────────
@@ -251,7 +271,7 @@ static NSURLSessionDataTask *hooked_req(id self, SEL _cmd, NSURLRequest *req, id
 
 // ─── Constructor ─────────────────────────────────────────────────────────────
 __attribute__((constructor)) static void initTweak(void) {
-    NSLog(@LOG_TAG "=== XoaInfo Fake Auth Loaded (debug) ===");
+    NSLog(@LOG_TAG "=== XoaInfo Fake Auth Loaded (debug2) ===");
 
     // j2cyd0Nd gateway
     Class gw = objc_getClass("j2cyd0Nd");
@@ -275,41 +295,42 @@ __attribute__((constructor)) static void initTweak(void) {
         }
     }
 
-    // y8WisN9t decryptor — list methods + hook c6chSi59
+    // y8WisN9t = RNCryptor — hook all c6chSi59 class methods (NOT instance method — returns primitive)
     Class dec = objc_getClass("y8WisN9t");
-    if (dec) {
-        unsigned int mc = 0;
-        Method *methods = class_copyMethodList(dec, &mc);
-        NSLog(@LOG_TAG "y8WisN9t instance methods (%u):", mc);
-        for (unsigned int i = 0; i < mc; i++)
-            NSLog(@LOG_TAG "  -[y8WisN9t %s]", sel_getName(method_getName(methods[i])));
-        free(methods);
+    if (!dec) { NSLog(@LOG_TAG "[!] y8WisN9t not found"); goto skip_dec; }
 
-        methods = class_copyMethodList(object_getClass(dec), &mc);
-        NSLog(@LOG_TAG "y8WisN9t class methods (%u):", mc);
-        for (unsigned int i = 0; i < mc; i++)
-            NSLog(@LOG_TAG "  +[y8WisN9t %s]", sel_getName(method_getName(methods[i])));
-        free(methods);
-
-        // Hook c6chSi59: as instance method
-        Method im = class_getInstanceMethod(dec, sel_registerName("c6chSi59:"));
-        if (im) {
-            orig_c6chSi59_inst = (DecryptFn)method_getImplementation(im);
-            method_setImplementation(im, (IMP)hooked_c6chSi59_inst);
-            NSLog(@LOG_TAG "[OK] -[y8WisN9t c6chSi59:] hooked");
+    {
+        Method m;
+        // +c6chSi59:b5NuCqT9:password:error:
+        m = class_getClassMethod(dec, sel_registerName("c6chSi59:b5NuCqT9:password:error:"));
+        if (m) {
+            orig_dec_pw = (DecryptPw)method_getImplementation(m);
+            method_setImplementation(m, (IMP)hooked_dec_pw);
+            NSLog(@LOG_TAG "[OK] +c6chSi59:b5NuCqT9:password:error: hooked");
         }
-        // Hook c6chSi59: as class method
-        Method cm = class_getClassMethod(dec, sel_registerName("c6chSi59:"));
-        if (cm) {
-            orig_c6chSi59_cls = (DecryptFn)method_getImplementation(cm);
-            method_setImplementation(cm, (IMP)hooked_c6chSi59_cls);
-            NSLog(@LOG_TAG "[OK] +[y8WisN9t c6chSi59:] hooked");
+        // +c6chSi59:b5NuCqT9:d2ZmQPQj:r1FIQ6ln:error:
+        m = class_getClassMethod(dec, sel_registerName("c6chSi59:b5NuCqT9:d2ZmQPQj:r1FIQ6ln:error:"));
+        if (m) {
+            orig_dec_kiv = (DecryptKeyIV)method_getImplementation(m);
+            method_setImplementation(m, (IMP)hooked_dec_kiv);
+            NSLog(@LOG_TAG "[OK] +c6chSi59:b5NuCqT9:d2ZmQPQj:r1FIQ6ln:error: hooked");
         }
-        if (!im && !cm)
-            NSLog(@LOG_TAG "[!] y8WisN9t c6chSi59: not found (check method list above)");
-    } else {
-        NSLog(@LOG_TAG "[!] y8WisN9t class not found");
+        // +c6chSi59:q69GFYW9:error:
+        m = class_getClassMethod(dec, sel_registerName("c6chSi59:q69GFYW9:error:"));
+        if (m) {
+            orig_dec_simple = (DecryptSimple)method_getImplementation(m);
+            method_setImplementation(m, (IMP)hooked_dec_simple);
+            NSLog(@LOG_TAG "[OK] +c6chSi59:q69GFYW9:error: hooked");
+        }
+        // +c6chSi59:z4QMWDbr:r1FIQ6ln:error:
+        m = class_getClassMethod(dec, sel_registerName("c6chSi59:z4QMWDbr:r1FIQ6ln:error:"));
+        if (m) {
+            orig_dec_iv = (DecryptIV)method_getImplementation(m);
+            method_setImplementation(m, (IMP)hooked_dec_iv);
+            NSLog(@LOG_TAG "[OK] +c6chSi59:z4QMWDbr:r1FIQ6ln:error: hooked");
+        }
     }
+    skip_dec:;
 
     // NSURLSession diagnostic
     Class sess = objc_getClass("NSURLSession");
@@ -318,7 +339,7 @@ __attribute__((constructor)) static void initTweak(void) {
         if (m) {
             orig_req = (NSURLSessionDataTask*(*)(id,SEL,NSURLRequest*,id))method_getImplementation(m);
             method_setImplementation(m, (IMP)hooked_req);
-            NSLog(@LOG_TAG "[OK] NSURLSession hooked (diagnostic)");
+            NSLog(@LOG_TAG "[OK] NSURLSession hooked");
         }
     }
 }
