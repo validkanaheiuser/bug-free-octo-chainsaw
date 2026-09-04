@@ -7,6 +7,7 @@
 #import <CommonCrypto/CommonCryptor.h>
 #import <CommonCrypto/CommonKeyDerivation.h>
 #import <CommonCrypto/CommonDigest.h>
+#import <CommonCrypto/CommonHMAC.h>
 
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
 
@@ -34,27 +35,58 @@ static NSString *md5Hex(NSString *s) {
     return r;
 }
 
-// Custom RNCryptor v3: PBKDF2(SHA512) encKey + actualIV, AES-256-CBC-PKCS7
-// blob = 0x03 0x01 | encSalt(8) | hmacSalt(8) | ivHeader(16) | CT | zeros(64)
+// Custom RNCryptor v3: PBKDF2(SHA512) keys, AES-256-CBC-PKCS7, HMAC-SHA512(64B) trailer
+// blob = 03 01 | encSalt(8) | hmacSalt(8) | ivHeader(16) | CT | HMAC-SHA512(64)
+// encKey  = PBKDF2(pw, encSalt||hmacSalt, SHA512, 10000, 32)
+// actualIV= PBKDF2(pw, ivHeader,          SHA512, 10000, 16)
+// hmacKey = PBKDF2(pw, hmacSalt,          SHA512, 10000, 32)   ← hmacSalt alone, separate from encKey
+// HMAC    = HMAC-SHA512(hmacKey, 03 01 || encSalt || hmacSalt || ivHeader || CT)
 static NSData *rncryptEncrypt(NSData *plain, NSString *password) {
     const char *pw = [password UTF8String];
     size_t pwLen   = strlen(pw);
+
     uint8_t encSalt[8], hmacSalt[8], ivHeader[16];
-    arc4random_buf(encSalt, 8); arc4random_buf(hmacSalt, 8); arc4random_buf(ivHeader, 16);
-    uint8_t combined[16]; memcpy(combined, encSalt, 8); memcpy(combined+8, hmacSalt, 8);
-    uint8_t encKey[32], actualIV[16];
-    CCKeyDerivationPBKDF(kCCPBKDF2, pw, pwLen, combined, 16, kCCPRFHmacAlgSHA512, 10000, encKey, 32);
-    CCKeyDerivationPBKDF(kCCPBKDF2, pw, pwLen, ivHeader, 16, kCCPRFHmacAlgSHA512, 10000, actualIV, 16);
+    arc4random_buf(encSalt, 8);
+    arc4random_buf(hmacSalt, 8);
+    arc4random_buf(ivHeader, 16);
+
+    uint8_t combined[16];
+    memcpy(combined, encSalt, 8);
+    memcpy(combined + 8, hmacSalt, 8);
+
+    uint8_t encKey[32], actualIV[16], hmacKey[32];
+    CCKeyDerivationPBKDF(kCCPBKDF2, pw, pwLen, combined,  16, kCCPRFHmacAlgSHA512, 10000, encKey,   32);
+    CCKeyDerivationPBKDF(kCCPBKDF2, pw, pwLen, ivHeader,  16, kCCPRFHmacAlgSHA512, 10000, actualIV, 16);
+    CCKeyDerivationPBKDF(kCCPBKDF2, pw, pwLen, hmacSalt,   8, kCCPRFHmacAlgSHA512, 10000, hmacKey,  32);
+
     size_t ctBufLen = plain.length + kCCBlockSizeAES128;
-    void *ctBuf = malloc(ctBufLen); size_t ctLen = 0;
+    void *ctBuf = malloc(ctBufLen);
+    size_t ctLen = 0;
     CCCrypt(kCCEncrypt, kCCAlgorithmAES, kCCOptionPKCS7Padding,
-            encKey, 32, actualIV, plain.bytes, plain.length, ctBuf, ctBufLen, &ctLen);
-    NSMutableData *blob = [NSMutableData dataWithCapacity:2+8+8+16+ctLen+64];
+            encKey, 32, actualIV,
+            plain.bytes, plain.length,
+            ctBuf, ctBufLen, &ctLen);
+
     uint8_t hdr[2] = {0x03, 0x01};
-    [blob appendBytes:hdr length:2]; [blob appendBytes:encSalt length:8];
-    [blob appendBytes:hmacSalt length:8]; [blob appendBytes:ivHeader length:16];
-    [blob appendBytes:ctBuf length:ctLen]; free(ctBuf);
-    uint8_t trailer[64] = {0}; [blob appendBytes:trailer length:64];
+
+    // HMAC-SHA512 over all preceding bytes (hdr + encSalt + hmacSalt + ivHeader + CT)
+    uint8_t hmac[CC_SHA512_DIGEST_LENGTH]; // 64 bytes
+    CCHmacContext ctx;
+    CCHmacInit(&ctx,   kCCHmacAlgSHA512, hmacKey, 32);
+    CCHmacUpdate(&ctx, hdr,      2);
+    CCHmacUpdate(&ctx, encSalt,  8);
+    CCHmacUpdate(&ctx, hmacSalt, 8);
+    CCHmacUpdate(&ctx, ivHeader, 16);
+    CCHmacUpdate(&ctx, ctBuf,    ctLen);
+    CCHmacFinal(&ctx, hmac);
+
+    NSMutableData *blob = [NSMutableData data];
+    [blob appendBytes:hdr      length:2];
+    [blob appendBytes:encSalt  length:8];
+    [blob appendBytes:hmacSalt length:8];
+    [blob appendBytes:ivHeader length:16];
+    [blob appendBytes:ctBuf    length:ctLen]; free(ctBuf);
+    [blob appendBytes:hmac     length:CC_SHA512_DIGEST_LENGTH];
     return blob;
 }
 
