@@ -35,12 +35,12 @@ static NSString *md5Hex(NSString *s) {
     return r;
 }
 
-// Custom RNCryptor v3: PBKDF2(SHA512) keys, AES-256-CBC-PKCS7, HMAC-SHA512(64B) trailer
-// blob = 03 01 | encSalt(8) | hmacSalt(8) | ivHeader(16) | CT | HMAC-SHA512(64)
+// Custom RNCryptor v3: PBKDF2(SHA512) keys, AES-256-CBC-PKCS7, HMAC-SHA256(32B) trailer
+// blob = 03 01 | encSalt(8) | hmacSalt(8) | ivHeader(16) | CT | HMAC-SHA256(32)
 // encKey  = PBKDF2(pw, encSalt||hmacSalt, SHA512, 10000, 32)
 // actualIV= PBKDF2(pw, ivHeader,          SHA512, 10000, 16)
-// hmacKey = PBKDF2(pw, hmacSalt,          SHA512, 10000, 32)   ← hmacSalt alone, separate from encKey
-// HMAC    = HMAC-SHA512(hmacKey, 03 01 || encSalt || hmacSalt || ivHeader || CT)
+// hmacKey = PBKDF2(pw, hmacSalt,          SHA512, 10000, 32)
+// HMAC    = HMAC-SHA256(hmacKey, 03 01 || encSalt || hmacSalt || ivHeader || CT)
 static NSData *rncryptEncrypt(NSData *plain, NSString *password) {
     const char *pw = [password UTF8String];
     size_t pwLen   = strlen(pw);
@@ -69,10 +69,10 @@ static NSData *rncryptEncrypt(NSData *plain, NSString *password) {
 
     uint8_t hdr[2] = {0x03, 0x01};
 
-    // HMAC-SHA512 over all preceding bytes (hdr + encSalt + hmacSalt + ivHeader + CT)
-    uint8_t hmac[CC_SHA512_DIGEST_LENGTH]; // 64 bytes
+    // HMAC-SHA256 over all preceding bytes (hdr + encSalt + hmacSalt + ivHeader + CT)
+    uint8_t hmac[CC_SHA256_DIGEST_LENGTH]; // 32 bytes
     CCHmacContext ctx;
-    CCHmacInit(&ctx,   kCCHmacAlgSHA512, hmacKey, 32);
+    CCHmacInit(&ctx,   kCCHmacAlgSHA256, hmacKey, 32);
     CCHmacUpdate(&ctx, hdr,      2);
     CCHmacUpdate(&ctx, encSalt,  8);
     CCHmacUpdate(&ctx, hmacSalt, 8);
@@ -86,7 +86,7 @@ static NSData *rncryptEncrypt(NSData *plain, NSString *password) {
     [blob appendBytes:hmacSalt length:8];
     [blob appendBytes:ivHeader length:16];
     [blob appendBytes:ctBuf    length:ctLen]; free(ctBuf);
-    [blob appendBytes:hmac     length:CC_SHA512_DIGEST_LENGTH];
+    [blob appendBytes:hmac     length:CC_SHA256_DIGEST_LENGTH];
     return blob;
 }
 
