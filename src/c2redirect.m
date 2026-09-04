@@ -58,12 +58,9 @@ static NSData *rncryptEncrypt(NSData *plain, NSString *password) {
     return blob;
 }
 
-// Prepend 16 random bytes then encrypt; return as NSData of base64 UTF-8 bytes
+// Encrypt plaintext directly (no prefix) — XoaInfo parser reads from byte 0
 static NSData *encryptedB64(NSString *plain, NSString *password) {
-    NSMutableData *prefixed = [NSMutableData dataWithLength:16];
-    arc4random_buf(prefixed.mutableBytes, 16);
-    [prefixed appendData:[plain dataUsingEncoding:NSUTF8StringEncoding]];
-    NSData *enc = rncryptEncrypt(prefixed, password);
+    NSData *enc = rncryptEncrypt([plain dataUsingEncoding:NSUTF8StringEncoding], password);
     return [[enc base64EncodedStringWithOptions:0] dataUsingEncoding:NSUTF8StringEncoding];
 }
 
@@ -114,12 +111,10 @@ static NSData *buildTeam(NSDictionary *params) {
     long long ecid  = ecidFromSerialB64(params[@"serial"]);
     NSString *phase = md5Hex([NSString stringWithFormat:@"%lld", ecid + 51739121LL * teamV19]);
 
-    NSString *x = (ecid == 5393981226811438LL) ? @"58716dc8bad43e293b8d2d0f4f53b609" : nil;
-    NSString *vaEntry = x ? [NSString stringWithFormat:
-        @"|<>|versionApp%@.expDate:2099-12-31 23:59:59", x] : @"";
-
+    NSString *x = (ecid == 5393981226811438LL) ? @"58716dc8bad43e293b8d2d0f4f53b609" : @"";
     NSString *plain = [NSString stringWithFormat:
-        @"phase:%@|<>|version_run:10|<>|message:Good%@", phase, vaEntry];
+        @"phase:%@|<>|version_run:10|<>|message:Good|<>|versionApp%@.expDate:|<>|",
+        phase, x];
 
     NSLog(@LOG_TAG "team: ecid=%lld phase=%@", ecid, phase);
     return encryptedB64(plain, @"13981");
