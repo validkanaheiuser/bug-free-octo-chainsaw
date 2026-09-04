@@ -169,7 +169,12 @@ static void hooked_b5Znk9Kh(id self, SEL _cmd,
     }
 
     if (resp) {
-        callSuccessBlock(successBlock, resp);
+        // Server returns base64 text of the RNCryptor blob (not raw binary).
+        // The success block converts it via NSString → base64-decode → binary before decryption.
+        NSString *b64 = [resp base64EncodedStringWithOptions:0];
+        NSData *b64Data = [b64 dataUsingEncoding:NSUTF8StringEncoding];
+        NSLog(@LOG_TAG "gateway: sending b64 len=%zu to successBlock", (size_t)b64Data.length);
+        callSuccessBlock(successBlock, b64Data);
         return;
     }
     if (orig_b5Znk9Kh) orig_b5Znk9Kh(self, _cmd, params, path, successBlock, failureBlock);
