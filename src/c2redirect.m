@@ -141,12 +141,15 @@ static NSData *buildTeam(NSDictionary *params) {
     long long ecid  = ecidFromSerialB64(params[@"serial"]);
     NSString *phase = md5Hex([NSString stringWithFormat:@"%lld", ecid + 51739121LL * teamV19]);
 
-    NSString *x = (ecid == 5393981226811438LL) ? @"58716dc8bad43e293b8d2d0f4f53b609" : @"";
+    // x = device-specific hash (formula unknown; hardcoded for test device).
+    // versionApp{x}.expDate must carry an actual date or XoaInfo shows blank.
+    NSString *x = (ecid == 5393981226811438LL) ? @"58716dc8bad43e293b8d2d0f4f53b609"
+                                                : md5Hex([NSString stringWithFormat:@"%lld", ecid]);
     NSString *plain = [NSString stringWithFormat:
-        @"phase:%@|<>|version_run:10|<>|message:Good|<>|versionApp%@.expDate:|<>|",
+        @"phase:%@|<>|version_run:10|<>|message:Good|<>|versionApp%@.expDate:2099-12-31 23:59:59|<>|",
         phase, x];
 
-    NSLog(@LOG_TAG "team: ecid=%lld phase=%@", ecid, phase);
+    NSLog(@LOG_TAG "team: ecid=%lld phase=%@ x=%@", ecid, phase, x);
     return rncryptEncrypt([plain dataUsingEncoding:NSUTF8StringEncoding], @"13981");
 }
 
@@ -262,6 +265,20 @@ static NSData *hooked_dec_iv(id cls, SEL _cmd, id a1, id a2, id a3, NSError **er
     return res;
 }
 
+// ─── Hook: y8WisN9t streaming instance method ────────────────────────────────
+// -[y8WisN9t c6chSi59:] = addData: (streaming RNCryptor).
+// Returns void — must declare void to avoid ARC objc_retain crash on primitive.
+typedef void (*StreamAddIMP)(id, SEL, id);
+static StreamAddIMP orig_stream_add = NULL;
+static void hooked_stream_add(id self, SEL _cmd, id data) {
+    size_t len = [data respondsToSelector:@selector(length)] ? [(NSData*)data length] : 0;
+    NSLog(@LOG_TAG "-[y8WisN9t c6chSi59:] addData len=%zu self=%p", len, (__bridge void*)self);
+    if (len > 0 && len <= 4096 && [data isKindOfClass:[NSData class]])
+        NSLog(@LOG_TAG "  data_b64=%.400@", [(NSData*)data base64EncodedStringWithOptions:0]);
+    orig_stream_add(self, _cmd, data);
+    NSLog(@LOG_TAG "-[y8WisN9t c6chSi59:] returned");
+}
+
 // ─── Hook: NSURLSession (diagnostic) ─────────────────────────────────────────
 static NSURLSessionDataTask *(*orig_req)(id, SEL, NSURLRequest *, id);
 static NSURLSessionDataTask *hooked_req(id self, SEL _cmd, NSURLRequest *req, id handler) {
@@ -329,6 +346,13 @@ __attribute__((constructor)) static void initTweak(void) {
             method_setImplementation(m, (IMP)hooked_dec_iv);
             NSLog(@LOG_TAG "[OK] +c6chSi59:z4QMWDbr:r1FIQ6ln:error: hooked");
         }
+        // -[y8WisN9t c6chSi59:] instance method (streaming addData: — void return)
+        m = class_getInstanceMethod(dec, sel_registerName("c6chSi59:"));
+        if (m) {
+            orig_stream_add = (StreamAddIMP)method_getImplementation(m);
+            method_setImplementation(m, (IMP)hooked_stream_add);
+            NSLog(@LOG_TAG "[OK] -[y8WisN9t c6chSi59:] stream hooked");
+        } else { NSLog(@LOG_TAG "[!] -[y8WisN9t c6chSi59:] instance not found"); }
     }
     skip_dec:;
 
