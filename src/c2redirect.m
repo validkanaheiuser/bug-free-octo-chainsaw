@@ -14,7 +14,7 @@
 // XoaInfo's state machine calls method_getImplementation and verifies the IMP
 // matches the expected (pre-hook) value. method_setImplementation changes the
 // IMP slot and triggers the anti-tamper. MSHookFunction patches only the
-// function body, leaving the Method struct IMP unchanged → verifier passes.
+// function body, leaving the Method struct IMP unchanged -> verifier passes.
 typedef void (*MSHookFunction_t)(void *symbol, void *hook, void **old);
 static MSHookFunction_t _mshook = NULL;
 
@@ -177,11 +177,12 @@ static NSData *buildTeam(NSDictionary *params) {
 }
 
 // ─── State for q69GFYW9 interception ─────────────────────────────────────────
-static volatile long long g_loginipEcid  = 0;
-static volatile long long g_loginipNonce = 0;
-static volatile long long g_teamEcid     = 0;
-static volatile long long g_teamNonce    = 0;  // derived from team checksum param (fallback if n2=0)
-static volatile BOOL      g_teamPending  = NO;
+static volatile long long g_loginipEcid        = 0;
+static volatile long long g_loginipNonce       = 0;
+static volatile long long g_teamEcid           = 0;
+static volatile long long g_teamNonce          = 0;  // derived from team checksum param
+static volatile BOOL      g_teamPending        = NO;
+static volatile BOOL      g_teamFirstDecryptDone = NO;  // set after first q69GFYW9 intercept
 // x = hash field from team params (e.g. "0a372322..."), stripped of "0x" and lowercased.
 // Server keys versionApp{x}.expDate under this device hash, NOT md5(ecid).
 static NSString          *g_teamX        = nil;
@@ -205,9 +206,10 @@ static void hooked_b5Znk9Kh(id self, SEL _cmd,
         return;
     } else if ([pathStr containsString:@"team"] || [pathStr containsString:@"X2.1Public"]) {
         long long tecid = ecidFromSerialB64(params[@"serial"]);
-        g_teamEcid    = tecid;
-        g_teamNonce   = nonceFromChecksumB64(params[@"checksum"], tecid);
-        g_teamPending = YES;
+        g_teamEcid             = tecid;
+        g_teamNonce            = nonceFromChecksumB64(params[@"checksum"], tecid);
+        g_teamPending          = YES;
+        g_teamFirstDecryptDone = NO;
         // x = device hash from params — server keys versionApp{x}.expDate under this.
         // Strip "0x"/"0X" prefix and lowercase to match the key format.
         NSString *hashRaw = [NSString stringWithFormat:@"%@", params[@"hash"]];
@@ -244,7 +246,7 @@ static id hooked_q3uTJBk1(id self, SEL _cmd, id key) {
 
     NSString *disp = result ? [NSString stringWithFormat:@"%@", result] : @"nil";
     if (disp.length > 60) disp = [[disp substringToIndex:60] stringByAppendingString:@"..."];
-    NSLog(@LOG_TAG "pref[%@]%@ → %@", k, spoofed ? @"(spoofed)" : @"", disp);
+    NSLog(@LOG_TAG "pref[%@]%@ -> %@", k, spoofed ? @"(spoofed)" : @"", disp);
     return result;
 }
 
@@ -300,7 +302,7 @@ static NSData *hooked_dec_kiv(id cls, SEL _cmd, id a1, id a2, id a3, id a4, NSEr
         NSLog(@LOG_TAG "  a1_b64=%.200@", [(NSData*)a1 base64EncodedStringWithOptions:0]);
     NSData *res = orig_dec_kiv(cls, _cmd, a1, a2, a3, a4, err);
     if (err && *err) NSLog(@LOG_TAG "  error=%@", *err);
-    NSLog(@LOG_TAG "  → result len=%zu", res.length);
+    NSLog(@LOG_TAG "  -> result len=%zu", res.length);
     return res;
 }
 
@@ -326,36 +328,51 @@ static NSData *hooked_dec_simple(id cls, SEL _cmd, id a1, id a2, NSError **err) 
                 @"expDate:2099-12-31 23:59:59|<>|phase:%@|<>|encrypted:%@|<>|"
                 @"version_run:10|<>|message:Good|<>|retention:%@|<>|deleteList:%@|<>|",
                 phase, b64str(@"#!/bin/sh\nexit 0\n"), b64str(@"\n"), b64str(@"\n")];
-            NSLog(@LOG_TAG "  → fake loginip plain ecid=%lld nonce=%lld phase=%@", ecid, nonce, phase);
+            NSLog(@LOG_TAG "  -> fake loginip plain ecid=%lld nonce=%lld phase=%@", ecid, nonce, phase);
             return [plain dataUsingEncoding:NSUTF8StringEncoding];
         }
         if (g_teamPending && g_teamEcid != 0) {
-            g_teamPending = NO;
-            long long ecid   = g_teamEcid;
-            // XoaInfo verifies team phase against MD5(ecid + 51739121 × Password pref),
-            // which equals g_loginipNonce (spoofed by hooked_q3uTJBk1 after loginip).
-            // n2 (15133) is the team DECRYPT nonce — a different key, unrelated to phase.
-            long long pnonce = (g_loginipNonce > 0) ? g_loginipNonce : n2;
+            g_teamPending          = NO;
+            g_teamFirstDecryptDone = YES;
+            long long ecid  = g_teamEcid;
+            // Use decrypt nonce (n2) for phase — it matches what XoaInfo used for encryption.
+            // Fall back to g_teamNonce if n2 is somehow 0.
+            long long pnonce = (n2 > 0) ? n2 : g_teamNonce;
             NSString *phase  = md5Hex([NSString stringWithFormat:@"%lld", ecid + 51739121LL * pnonce]);
             NSString *x      = g_teamX ?: md5Hex([NSString stringWithFormat:@"%lld", ecid]);
-            // Mirror loginip format: same encrypted/retention/deleteList fields.
-            // XoaInfo rangeOfString:"encrypted:" on team response — missing → Packaged3=0.
+            // encrypted: content will be decrypted in a second q69GFYW9 call (len1>0).
+            // We intercept that call too, so the content here can be anything non-empty.
             NSString *plain = [NSString stringWithFormat:
                 @"phase:%@|<>|version_run:10|<>|message:Good|<>|"
                 @"versionApp%@.expDate:2099-12-31 23:59:59|<>|"
-                @"encrypted:%@|<>|retention:%@|<>|deleteList:%@|<>|",
+                @"encrypted:%@|<>|retention:%@|<>|deleteList:%@|<>|"
+                @"Packaged3:1|<>|Packaged4:1|<>|",
                 phase, x,
                 b64str(@"#!/bin/sh\nexit 0\n"),
                 b64str(@"\n"),
                 b64str(@"\n")];
-            NSLog(@LOG_TAG "  → fake team plain ecid=%lld n2=%lld teamNonce=%lld phase=%@ x=%@", ecid, n2, pnonce, phase, x);
+            NSLog(@LOG_TAG "  -> fake team 1st ecid=%lld n2=%lld pnonce=%lld phase=%@ x=%@",
+                  ecid, n2, pnonce, phase, x);
             return [plain dataUsingEncoding:NSUTF8StringEncoding];
         }
     }
 
+    // Second team decrypt: XoaInfo decrypts the 'encrypted:' field from our first team response.
+    // len1 > 0 because it's the decoded encrypted: blob; intercept before orig_dec_simple fails on it.
+    if (g_teamFirstDecryptDone && g_teamEcid != 0 && len1 > 0 && len1 < 4096) {
+        long long ecid   = g_teamEcid;
+        long long pnonce = (n2 > 0) ? n2 : g_teamNonce;
+        NSString *phase2 = md5Hex([NSString stringWithFormat:@"%lld", ecid + 51739121LL * pnonce]);
+        NSString *plain = [NSString stringWithFormat:
+            @"phase:%@|<>|message:Good|<>|Packaged3:1|<>|Packaged4:1|<>|",
+            phase2];
+        NSLog(@LOG_TAG "  -> fake team 2nd ecid=%lld n2=%lld phase=%@", ecid, n2, phase2);
+        return [plain dataUsingEncoding:NSUTF8StringEncoding];
+    }
+
     NSData *res = orig_dec_simple(cls, _cmd, a1, a2, err);
     if (err && *err) NSLog(@LOG_TAG "  error=%@", *err);
-    NSLog(@LOG_TAG "  → result len=%zu", res.length);
+    NSLog(@LOG_TAG "  -> result len=%zu", res.length);
     return res;
 }
 
@@ -370,7 +387,7 @@ static NSData *hooked_dec_iv(id cls, SEL _cmd, id a1, id a2, id a3, NSError **er
           [a3 respondsToSelector:@selector(length)] ? [(NSData*)a3 length] : 0);
     NSData *res = orig_dec_iv(cls, _cmd, a1, a2, a3, err);
     if (err && *err) NSLog(@LOG_TAG "  error=%@", *err);
-    NSLog(@LOG_TAG "  → result len=%zu", res.length);
+    NSLog(@LOG_TAG "  -> result len=%zu", res.length);
     return res;
 }
 
