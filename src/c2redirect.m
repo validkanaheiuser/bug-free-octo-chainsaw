@@ -393,9 +393,17 @@ static PrefSet orig_pref_set = NULL;
 static void hooked_pref_set(id self, SEL _cmd, id value, id key) {
     NSString *k = [NSString stringWithFormat:@"%@", key];
     NSString *v = value ? [NSString stringWithFormat:@"%@", value] : @"nil";
-    if (v.length > 80) v = [[v substringToIndex:80] stringByAppendingString:@"..."];
+    if (v.length > 120) v = [[v substringToIndex:120] stringByAppendingString:@"..."];
     NSLog(@LOG_TAG "pref_SET[%@] = %@", k, v);
     if (orig_pref_set) orig_pref_set(self, _cmd, value, key);
+}
+
+// ─── Hook: s7AcUOKf setA3JKER2u: ─────────────────────────────────────────────
+typedef void (*LicenseSetter)(id, SEL, BOOL);
+static LicenseSetter orig_license_set = NULL;
+static void hooked_license_set(id self, SEL _cmd, BOOL val) {
+    NSLog(@LOG_TAG ">>> setA3JKER2u:(%d) <<<", (int)val);
+    if (orig_license_set) orig_license_set(self, _cmd, val);
 }
 
 // ─── Hook: NSURLSession — logging only, MSHookFunction to avoid anti-tamper ───
@@ -443,8 +451,17 @@ __attribute__((constructor)) static void initTweak(void) {
     // s7AcUOKf preferences
     Class pref = objc_getClass("s7AcUOKf");
     if (pref) {
-        Method m = class_getClassMethod(pref, sel_registerName("q3uTJBk1:"));
+        Method m;
+        m = class_getClassMethod(pref, sel_registerName("q3uTJBk1:"));
         hookImp(m, (void*)hooked_q3uTJBk1, (void**)&orig_q3uTJBk1, "s7AcUOKf q3uTJBk1:");
+
+        m = class_getClassMethod(pref, sel_registerName("c2Uu7nHV:forKey:"));
+        if (m) hookImp(m, (void*)hooked_pref_set, (void**)&orig_pref_set, "s7AcUOKf c2Uu7nHV:forKey:");
+        else NSLog(@LOG_TAG "[!] c2Uu7nHV:forKey: not found");
+
+        m = class_getClassMethod(pref, sel_registerName("setA3JKER2u:"));
+        if (m) hookImp(m, (void*)hooked_license_set, (void**)&orig_license_set, "s7AcUOKf setA3JKER2u:");
+        else NSLog(@LOG_TAG "[!] setA3JKER2u: not found");
     }
 
     // y8WisN9t = RNCryptor — hook all c6chSi59 class methods (NOT instance method — returns primitive)
