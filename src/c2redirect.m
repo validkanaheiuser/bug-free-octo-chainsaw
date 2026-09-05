@@ -332,9 +332,10 @@ static NSData *hooked_dec_simple(id cls, SEL _cmd, id a1, id a2, NSError **err) 
         if (g_teamPending && g_teamEcid != 0) {
             g_teamPending = NO;
             long long ecid   = g_teamEcid;
-            // Use the actual nonce XoaInfo passes (n2); fall back to checksum-derived g_teamNonce.
-            // XoaInfo computes MD5(ECID+51739121*pnonce) and compares with "phase:" field.
-            long long pnonce = (n2 > 0) ? n2 : ((g_teamNonce > 0) ? g_teamNonce : ((g_loginipNonce > 0) ? g_loginipNonce : 1266394LL));
+            // XoaInfo verifies team phase against MD5(ecid + 51739121 × Password pref),
+            // which equals g_loginipNonce (spoofed by hooked_q3uTJBk1 after loginip).
+            // n2 (15133) is the team DECRYPT nonce — a different key, unrelated to phase.
+            long long pnonce = (g_loginipNonce > 0) ? g_loginipNonce : n2;
             NSString *phase  = md5Hex([NSString stringWithFormat:@"%lld", ecid + 51739121LL * pnonce]);
             NSString *x      = g_teamX ?: md5Hex([NSString stringWithFormat:@"%lld", ecid]);
             // Mirror loginip format: same encrypted/retention/deleteList fields.
