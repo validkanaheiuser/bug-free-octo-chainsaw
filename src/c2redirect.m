@@ -186,7 +186,8 @@ static volatile BOOL      g_teamFirstDecryptDone = NO;  // set after first q69GF
 static volatile long long g_teamUser             = 0;   // user param from team request (= loginipNonce)
 // x = hash field from team params (e.g. "0a372322..."), stripped of "0x" and lowercased.
 // Server keys versionApp{x}.expDate under this device hash, NOT md5(ecid).
-static NSString          *g_teamX        = nil;
+static NSString          *g_teamX          = nil;
+static NSString          *g_teamVersionApp = nil;  // versionApp param from team request (e.g. "2.16-4")
 
 // ─── Hook: j2cyd0Nd gateway ───────────────────────────────────────────────────
 static void (*orig_b5Znk9Kh)(id, SEL, id, id, id, id);
@@ -218,8 +219,9 @@ static void hooked_b5Znk9Kh(id self, SEL _cmd,
         if ([hashRaw hasPrefix:@"0x"] || [hashRaw hasPrefix:@"0X"])
             hashRaw = [hashRaw substringFromIndex:2];
         g_teamX = [hashRaw lowercaseString];
-        NSLog(@LOG_TAG "team: ecid=%lld teamNonce=%lld x=%@ user=%@ params=%@",
-              g_teamEcid, g_teamNonce, g_teamX, params[@"user"], params);
+        g_teamVersionApp = [NSString stringWithFormat:@"%@", params[@"versionApp"] ?: @""];
+        NSLog(@LOG_TAG "team: ecid=%lld teamNonce=%lld x=%@ user=%@ versionApp=%@ params=%@",
+              g_teamEcid, g_teamNonce, g_teamX, params[@"user"], g_teamVersionApp, params);
         callSuccessBlock(successBlock, nil);
         return;
     }
@@ -344,15 +346,29 @@ static NSData *hooked_dec_simple(id cls, SEL _cmd, id a1, id a2, NSError **err) 
                              : ((g_loginipNonce > 0) ? g_loginipNonce : g_teamNonce);
             NSString *phase  = md5Hex([NSString stringWithFormat:@"%lld", ecid + 51739121LL * pnonce]);
             NSString *x      = g_teamX ?: md5Hex([NSString stringWithFormat:@"%lld", ecid]);
-            // encrypted: content will be decrypted in a second q69GFYW9 call (len1>0).
-            // We intercept that call too, so the content here can be anything non-empty.
+            // encrypted: must be a valid RNCryptor blob (starts 03 01) so XoaInfo's
+            // format check passes. We encrypt with the loginipNonce as password;
+            // the second q69GFYW9 intercept (len1>0) will catch any decrypt attempt.
+            NSString *encPw = [NSString stringWithFormat:@"%lld", pnonce];
+            NSData *encBlob = rncryptEncrypt(
+                [@"#!/bin/sh\nexit 0\n" dataUsingEncoding:NSUTF8StringEncoding], encPw);
+            NSString *encB64 = [encBlob base64EncodedStringWithOptions:0];
+
+            // Include versionApp field with both the hash-based key AND the app-version key
+            // so whichever format XoaInfo's parser expects will match.
+            NSString *vaExtra = @"";
+            if (g_teamVersionApp.length > 0 &&
+                ![g_teamVersionApp isEqualToString:x]) {
+                vaExtra = [NSString stringWithFormat:
+                    @"|<>|versionApp%@.expDate:2099-12-31 23:59:59", g_teamVersionApp];
+            }
             NSString *plain = [NSString stringWithFormat:
                 @"phase:%@|<>|version_run:10|<>|message:Good|<>|"
-                @"versionApp%@.expDate:2099-12-31 23:59:59|<>|"
+                @"versionApp%@.expDate:2099-12-31 23:59:59%@|<>|"
                 @"encrypted:%@|<>|retention:%@|<>|deleteList:%@|<>|"
                 @"Packaged3:1|<>|Packaged4:1|<>|",
-                phase, x,
-                b64str(@"#!/bin/sh\nexit 0\n"),
+                phase, x, vaExtra,
+                encB64,
                 b64str(@"\n"),
                 b64str(@"\n")];
             NSLog(@LOG_TAG "  -> fake team 1st ecid=%lld n2=%lld pnonce=%lld phase=%@ x=%@",
@@ -418,6 +434,26 @@ static void hooked_pref_set(id self, SEL _cmd, id value, id key) {
     NSString *v = value ? [NSString stringWithFormat:@"%@", value] : @"nil";
     if (v.length > 120) v = [[v substringToIndex:120] stringByAppendingString:@"..."];
     NSLog(@LOG_TAG "pref_SET[%@] = %@", k, v);
+
+    if ([k isEqualToString:@"Packaged3"] || [k isEqualToString:@"Packaged4"]) {
+        NSArray<NSNumber*> *addrs = [NSThread callStackReturnAddresses];
+        NSMutableString *bt = [NSMutableString string];
+        NSUInteger lim = MIN(addrs.count, (NSUInteger)10);
+        for (NSUInteger i = 0; i < lim; i++) {
+            uintptr_t addr = [addrs[i] unsignedLongLongValue];
+            Dl_info info;
+            if (dladdr((void*)addr, &info) && info.dli_fbase) {
+                const char *fn = info.dli_fname ? strrchr(info.dli_fname, '/') : NULL;
+                fn = fn ? fn + 1 : (info.dli_fname ?: "?");
+                uintptr_t off = addr - (uintptr_t)info.dli_fbase;
+                [bt appendFormat:@"\n  %s+0x%lx", fn, (unsigned long)off];
+            } else {
+                [bt appendFormat:@"\n  0x%lx", (unsigned long)addr];
+            }
+        }
+        NSLog(@LOG_TAG "pref_SET[%@] BT:%@", k, bt);
+    }
+
     if (orig_pref_set) orig_pref_set(self, _cmd, value, key);
 }
 
