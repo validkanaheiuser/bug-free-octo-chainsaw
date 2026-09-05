@@ -72,6 +72,13 @@ static NSString *md5Hex(NSString *s) {
     return r;
 }
 
+// phase = MD5(base64Decode(checksum param)) — matches XoaInfo+0x2d3860 computation
+static NSString *checksumPhase(NSString *checksumB64) {
+    NSData *d = checksumB64 ? [[NSData alloc] initWithBase64EncodedString:checksumB64 options:0] : nil;
+    NSString *s = d ? [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding] : nil;
+    return md5Hex(s ?: @"");
+}
+
 // blob = 03 01 | encSalt(8) | hmacSalt(8) | ivHeader(16) | CT | zeros(64)
 // encKey   = PBKDF2(pw, encSalt||hmacSalt, SHA512, 10000, 32)
 // actualIV = PBKDF2(pw, ivHeader,          SHA512, 10000, 16)
@@ -188,6 +195,7 @@ static volatile long long g_teamUser             = 0;   // user param from team 
 // Server keys versionApp{x}.expDate under this device hash, NOT md5(ecid).
 static NSString          *g_teamX          = nil;
 static NSString          *g_teamVersionApp = nil;  // versionApp param from team request (e.g. "2.16-4")
+static NSString          *g_teamChecksum   = nil;  // raw checksum b64; phase = MD5(base64Decode(checksum))
 
 // ─── Hook: j2cyd0Nd gateway ───────────────────────────────────────────────────
 static void (*orig_b5Znk9Kh)(id, SEL, id, id, id, id);
@@ -220,6 +228,7 @@ static void hooked_b5Znk9Kh(id self, SEL _cmd,
             hashRaw = [hashRaw substringFromIndex:2];
         g_teamX = [hashRaw lowercaseString];
         g_teamVersionApp = [NSString stringWithFormat:@"%@", params[@"versionApp"] ?: @""];
+        g_teamChecksum = [NSString stringWithFormat:@"%@", params[@"checksum"] ?: @""];
         NSLog(@LOG_TAG "team: ecid=%lld teamNonce=%lld x=%@ user=%@ versionApp=%@ params=%@",
               g_teamEcid, g_teamNonce, g_teamX, params[@"user"], g_teamVersionApp, params);
         callSuccessBlock(successBlock, nil);
@@ -272,7 +281,7 @@ static NSData *hooked_dec_pw(id cls, SEL _cmd, id arg1, id arg2, NSString *pw, N
         g_teamPending = NO;
         long long ecid   = g_teamEcid;
         long long pnonce = (g_loginipNonce > 0) ? g_loginipNonce : [pw longLongValue];
-        NSString *phase  = md5Hex([NSString stringWithFormat:@"%lld", ecid + 51739121LL * pnonce]);
+        NSString *phase  = checksumPhase(g_teamChecksum);
         NSString *x      = g_teamX ?: md5Hex([NSString stringWithFormat:@"%lld", ecid]);
         NSString *plain = [NSString stringWithFormat:
             @"phase:%@|<>|version_run:10|<>|message:Good|<>|"
@@ -339,9 +348,8 @@ static NSData *hooked_dec_simple(id cls, SEL _cmd, id a1, id a2, NSError **err) 
             g_teamPending          = NO;
             g_teamFirstDecryptDone = YES;
             long long ecid  = g_teamEcid;
-            // Phase nonce = team decrypt nonce (n2) — app computes phase as MD5(ecid + 51739121 * teamNonce).
             long long pnonce = (n2 > 0) ? n2 : g_teamNonce;
-            NSString *phase  = md5Hex([NSString stringWithFormat:@"%lld", ecid + 51739121LL * pnonce]);
+            NSString *phase  = checksumPhase(g_teamChecksum);
             NSString *x      = g_teamX ?: md5Hex([NSString stringWithFormat:@"%lld", ecid]);
             // encrypted: must be a valid RNCryptor blob (starts 03 01) so XoaInfo's
             // format check passes. We encrypt with the loginipNonce as password;
@@ -378,8 +386,7 @@ static NSData *hooked_dec_simple(id cls, SEL _cmd, id a1, id a2, NSError **err) 
     // len1 > 0 because it's the decoded encrypted: blob; intercept before orig_dec_simple fails on it.
     if (g_teamFirstDecryptDone && g_teamEcid != 0 && len1 > 0 && len1 < 4096) {
         long long ecid   = g_teamEcid;
-        long long pnonce = g_teamNonce;
-        NSString *phase2 = md5Hex([NSString stringWithFormat:@"%lld", ecid + 51739121LL * pnonce]);
+        NSString *phase2 = checksumPhase(g_teamChecksum);
         NSString *plain = [NSString stringWithFormat:
             @"phase:%@|<>|message:Good|<>|Packaged3:1|<>|Packaged4:1|<>|",
             phase2];
