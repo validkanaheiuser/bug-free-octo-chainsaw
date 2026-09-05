@@ -339,11 +339,8 @@ static NSData *hooked_dec_simple(id cls, SEL _cmd, id a1, id a2, NSError **err) 
             g_teamPending          = NO;
             g_teamFirstDecryptDone = YES;
             long long ecid  = g_teamEcid;
-            // Phase nonce = user param (= loginipNonce sent in team request, same as loginip nonce).
-            // XoaInfo validates team phase against MD5(ecid + 51739121 * user).
-            // n2 is the DECRYPT nonce — unrelated to phase verification.
-            long long pnonce = (g_teamUser > 0) ? g_teamUser
-                             : ((g_loginipNonce > 0) ? g_loginipNonce : g_teamNonce);
+            // Phase nonce = team decrypt nonce (n2) — app computes phase as MD5(ecid + 51739121 * teamNonce).
+            long long pnonce = (n2 > 0) ? n2 : g_teamNonce;
             NSString *phase  = md5Hex([NSString stringWithFormat:@"%lld", ecid + 51739121LL * pnonce]);
             NSString *x      = g_teamX ?: md5Hex([NSString stringWithFormat:@"%lld", ecid]);
             // encrypted: must be a valid RNCryptor blob (starts 03 01) so XoaInfo's
@@ -381,8 +378,7 @@ static NSData *hooked_dec_simple(id cls, SEL _cmd, id a1, id a2, NSError **err) 
     // len1 > 0 because it's the decoded encrypted: blob; intercept before orig_dec_simple fails on it.
     if (g_teamFirstDecryptDone && g_teamEcid != 0 && len1 > 0 && len1 < 4096) {
         long long ecid   = g_teamEcid;
-        long long pnonce = (g_teamUser > 0) ? g_teamUser
-                         : ((g_loginipNonce > 0) ? g_loginipNonce : g_teamNonce);
+        long long pnonce = g_teamNonce;
         NSString *phase2 = md5Hex([NSString stringWithFormat:@"%lld", ecid + 51739121LL * pnonce]);
         NSString *plain = [NSString stringWithFormat:
             @"phase:%@|<>|message:Good|<>|Packaged3:1|<>|Packaged4:1|<>|",
