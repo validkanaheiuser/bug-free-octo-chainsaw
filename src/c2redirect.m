@@ -181,8 +181,9 @@ static volatile long long g_loginipEcid        = 0;
 static volatile long long g_loginipNonce       = 0;
 static volatile long long g_teamEcid           = 0;
 static volatile long long g_teamNonce          = 0;  // derived from team checksum param
-static volatile BOOL      g_teamPending        = NO;
+static volatile BOOL      g_teamPending          = NO;
 static volatile BOOL      g_teamFirstDecryptDone = NO;  // set after first q69GFYW9 intercept
+static volatile long long g_teamUser             = 0;   // user param from team request (= loginipNonce)
 // x = hash field from team params (e.g. "0a372322..."), stripped of "0x" and lowercased.
 // Server keys versionApp{x}.expDate under this device hash, NOT md5(ecid).
 static NSString          *g_teamX        = nil;
@@ -208,6 +209,7 @@ static void hooked_b5Znk9Kh(id self, SEL _cmd,
         long long tecid = ecidFromSerialB64(params[@"serial"]);
         g_teamEcid             = tecid;
         g_teamNonce            = nonceFromChecksumB64(params[@"checksum"], tecid);
+        g_teamUser             = [params[@"user"] longLongValue];  // = loginipNonce
         g_teamPending          = YES;
         g_teamFirstDecryptDone = NO;
         // x = device hash from params — server keys versionApp{x}.expDate under this.
@@ -335,9 +337,11 @@ static NSData *hooked_dec_simple(id cls, SEL _cmd, id a1, id a2, NSError **err) 
             g_teamPending          = NO;
             g_teamFirstDecryptDone = YES;
             long long ecid  = g_teamEcid;
-            // Use decrypt nonce (n2) for phase — it matches what XoaInfo used for encryption.
-            // Fall back to g_teamNonce if n2 is somehow 0.
-            long long pnonce = (n2 > 0) ? n2 : g_teamNonce;
+            // Phase nonce = user param (= loginipNonce sent in team request, same as loginip nonce).
+            // XoaInfo validates team phase against MD5(ecid + 51739121 * user).
+            // n2 is the DECRYPT nonce — unrelated to phase verification.
+            long long pnonce = (g_teamUser > 0) ? g_teamUser
+                             : ((g_loginipNonce > 0) ? g_loginipNonce : g_teamNonce);
             NSString *phase  = md5Hex([NSString stringWithFormat:@"%lld", ecid + 51739121LL * pnonce]);
             NSString *x      = g_teamX ?: md5Hex([NSString stringWithFormat:@"%lld", ecid]);
             // encrypted: content will be decrypted in a second q69GFYW9 call (len1>0).
@@ -361,7 +365,8 @@ static NSData *hooked_dec_simple(id cls, SEL _cmd, id a1, id a2, NSError **err) 
     // len1 > 0 because it's the decoded encrypted: blob; intercept before orig_dec_simple fails on it.
     if (g_teamFirstDecryptDone && g_teamEcid != 0 && len1 > 0 && len1 < 4096) {
         long long ecid   = g_teamEcid;
-        long long pnonce = (n2 > 0) ? n2 : g_teamNonce;
+        long long pnonce = (g_teamUser > 0) ? g_teamUser
+                         : ((g_loginipNonce > 0) ? g_loginipNonce : g_teamNonce);
         NSString *phase2 = md5Hex([NSString stringWithFormat:@"%lld", ecid + 51739121LL * pnonce]);
         NSString *plain = [NSString stringWithFormat:
             @"phase:%@|<>|message:Good|<>|Packaged3:1|<>|Packaged4:1|<>|",
