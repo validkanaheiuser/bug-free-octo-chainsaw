@@ -382,18 +382,6 @@ static NSData *hooked_dec_simple(id cls, SEL _cmd, id a1, id a2, NSError **err) 
         }
     }
 
-    // Second team decrypt: XoaInfo decrypts the 'encrypted:' field from our first team response.
-    // len1 > 0 because it's the decoded encrypted: blob; intercept before orig_dec_simple fails on it.
-    if (g_teamFirstDecryptDone && g_teamEcid != 0 && len1 > 0 && len1 < 4096) {
-        long long ecid   = g_teamEcid;
-        NSString *phase2 = checksumPhase(g_teamChecksum);
-        NSString *plain = [NSString stringWithFormat:
-            @"phase:%@|<>|message:Good|<>|Packaged3:1|<>|Packaged4:1|<>|",
-            phase2];
-        NSLog(@LOG_TAG "  -> fake team 2nd ecid=%lld n2=%lld phase=%@", ecid, n2, phase2);
-        return [plain dataUsingEncoding:NSUTF8StringEncoding];
-    }
-
     NSData *res = orig_dec_simple(cls, _cmd, a1, a2, err);
     if (err && *err) NSLog(@LOG_TAG "  error=%@", *err);
     NSLog(@LOG_TAG "  -> result len=%zu", res.length);
